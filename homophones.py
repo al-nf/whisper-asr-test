@@ -1,4 +1,6 @@
 import argparse
+import csv
+import glob
 import json
 import math
 import os
@@ -168,6 +170,56 @@ def save_json(path: str, payload) -> None:
         json.dump(payload, f, ensure_ascii=False, indent=2)
 
 
+def load_json(path: str):
+    with open(path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def save_datapoints_csv(path: str, results: list[dict]) -> None:
+    fieldnames = [
+        "locale",
+        "language_label",
+        "model",
+        "language",
+        "index",
+        "sentence_wer",
+        "sentence_cer",
+        "homophonic_density",
+        "homophone_units",
+        "pronunciation_units",
+        "unique_pronunciations",
+        "ref",
+        "hyp",
+        "ref_clean",
+        "hyp_clean",
+    ]
+    with open(path, "w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        for result in results:
+            metadata = {
+                "locale": result["locale"],
+                "language_label": result["language_label"],
+                "model": result["model"],
+                "language": result["language"],
+            }
+            for row in result["rows"]:
+                datapoint = {key: row.get(key) for key in fieldnames}
+                datapoint.update(metadata)
+                writer.writerow(datapoint)
+
+
+def export_datapoints_from_run_dir(run_dir: str) -> str:
+    results = []
+    for path in sorted(glob.glob(os.path.join(run_dir, "*_auto.json"))):
+        result = load_json(path)
+        if "rows" in result:
+            results.append(result)
+    output_path = os.path.join(run_dir, "datapoints.csv")
+    save_datapoints_csv(output_path, results)
+    return output_path
+
+
 def evaluate_model(dataset: Iterable[dict], model_size: str, locale_cfg: dict) -> dict:
     locale = locale_cfg["locale"]
     lang = locale_cfg["lang"]
@@ -289,13 +341,24 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Optional sample limit for quick smoke tests.",
     )
+    parser.add_argument(
+        "--export-csv-from",
+        default=None,
+        help="Build datapoints.csv from an existing run directory without re-running ASR.",
+    )
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
+    if args.export_csv_from is not None:
+        output_path = export_datapoints_from_run_dir(args.export_csv_from)
+        print(f"Datapoints saved to: {output_path}")
+        return
+
     run_dir = get_run_dir()
     all_results = []
+    datapoint_results = []
 
     for locale_cfg in LOCALES:
         print(f"\n{'=' * 60}")
@@ -308,9 +371,11 @@ def main() -> None:
         for model_size in args.models:
             try:
                 result = evaluate_model(dataset, model_size, locale_cfg)
+                datapoint_results.append(result)
                 all_results.append({k: v for k, v in result.items() if k != "rows"})
                 output_name = f"{locale_cfg['label']}_{model_size}_auto.json"
                 save_json(os.path.join(run_dir, output_name), result)
+                save_datapoints_csv(os.path.join(run_dir, "datapoints.csv"), datapoint_results)
                 print_results_table(all_results)
             except Exception as exc:
                 failure = {
@@ -331,6 +396,7 @@ def main() -> None:
                 print(exc)
 
     save_json(os.path.join(run_dir, "summary.json"), all_results)
+    save_datapoints_csv(os.path.join(run_dir, "datapoints.csv"), datapoint_results)
     save_results_table(run_dir, all_results)
     print(f"Results saved to: {run_dir}")
 
