@@ -266,6 +266,19 @@ wheels = [
 ]
 
 [[package]]
+name = "cmudict"
+version = "1.1.3"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "importlib-metadata" },
+    { name = "importlib-resources" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/d2/f3/b018f2f31ef7d15956fb343cd48dbb091ffe9e4f5132722f428fc665aa50/cmudict-1.1.3.tar.gz", hash = "sha256:f6c1cb9a2ffecef387bf1a1b93be6c61c91bc6f41714f183c3eb4d5b3e1ff5f6", size = 935743, upload-time = "2026-01-03T16:17:57.535Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/fe/1c/580ae2d5b3eef081305b4b8bd89f7e7945c4d6351c10069ecd2590da1310/cmudict-1.1.3-py3-none-any.whl", hash = "sha256:e4d421341bf9fa774bcded8e7d6c5d73a1bf8f88edbe129207713850abac4995", size = 939711, upload-time = "2026-01-03T16:17:56.345Z" },
+]
+
+[[package]]
 name = "colorama"
 version = "0.4.6"
 source = { registry = "https://pypi.org/simple" }
@@ -565,6 +578,27 @@ source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/cd/63/9496c57188a2ee585e0f1db071d75089a11e98aa86eb99d9d7618fc1edce/idna-3.18.tar.gz", hash = "sha256:ffb385a7e039654cef1ab9ef32c6fafe283c0c0467bba1d9029738ce4a14a848", size = 196711, upload-time = "2026-06-02T14:34:07.794Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/1e/5e/d4e9f1a599fb8e573b7b87160658329fbf28d19eac2718f51fc3def3aa5a/idna-3.18-py3-none-any.whl", hash = "sha256:7f952cbe720b688055e3f87de14f5c3e5fdaa8bc3928985c4077ca689de849a2", size = 65455, upload-time = "2026-06-02T14:34:06.319Z" },
+]
+
+[[package]]
+name = "importlib-metadata"
+version = "9.0.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "zipp" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/a9/01/15bb152d77b21318514a96f43af312635eb2500c96b55398d020c93d86ea/importlib_metadata-9.0.0.tar.gz", hash = "sha256:a4f57ab599e6a2e3016d7595cfd72eb4661a5106e787a95bcc90c7105b831efc", size = 56405, upload-time = "2026-03-20T06:42:56.999Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/38/3d/2d244233ac4f76e38533cfcb2991c9eb4c7bf688ae0a036d30725b8faafe/importlib_metadata-9.0.0-py3-none-any.whl", hash = "sha256:2d21d1cc5a017bd0559e36150c21c830ab1dc304dedd1b7ea85d20f45ef3edd7", size = 27789, upload-time = "2026-03-20T06:42:55.665Z" },
+]
+
+[[package]]
+name = "importlib-resources"
+version = "7.1.0"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/e4/06/b56dfa750b44e86157093bc8fca0ab81dccbf5260510de4eaf1cb69b5b99/importlib_resources-7.1.0.tar.gz", hash = "sha256:0722d4c6212489c530f2a145a34c0a7a3b4721bc96a15fada5930e2a0b760708", size = 44985, upload-time = "2026-04-12T16:36:09.232Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/8a/db/55a262f3606bebcae07cc14095338471ad7c0bbcaa37707e6f0ee49725b7/importlib_resources-7.1.0-py3-none-any.whl", hash = "sha256:1bd7b48b4088eddb2cd16382150bb515af0bd2c70128194392725f82ad2c96a1", size = 37232, upload-time = "2026-04-12T16:36:08.219Z" },
 ]
 
 [[package]]
@@ -1105,6 +1139,18 @@ wheels = [
 ]
 
 [[package]]
+name = "pronouncing"
+version = "0.3.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "cmudict" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/f5/cd/87ff0e7fcd1acdb25955735658c61aca75800e1570270e29f3c57da07235/pronouncing-0.3.0.tar.gz", hash = "sha256:349664045d059f44032e5fda626210490b1808e4969194a958dd205c526e978a", size = 17867, upload-time = "2026-04-17T04:07:35.366Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/b7/5d/ecb2b6e822df7fb0c86939b29bc48193e15c350433821e5f4c7d669e79cb/pronouncing-0.3.0-py3-none-any.whl", hash = "sha256:347bd30f00e28048474b99a8f1fc2e80f845dabdd7f3dce9d03c84f02c710f04", size = 5149, upload-time = "2026-04-17T04:07:33.958Z" },
+]
+
+[[package]]
 name = "propcache"
 version = "0.5.2"
 source = { registry = "https://pypi.org/simple" }
@@ -1218,6 +1264,22 @@ wheels = [
 ]
 
 [[package]]
+name = "pycantonese"
+version = "5.0.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "rustling" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/09/09/32e8000e39eb9ff034e1d55a86536a14abab90f2f4df176129fd90c43c29/pycantonese-5.0.0.tar.gz", hash = "sha256:8655ba3cd891b528d6b070245abed55b20a08d673f1056fcf9afad0adbc47c1d", size = 39584891, upload-time = "2026-05-26T05:59:49.252Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/1e/80/9b7163e41a460c7455026b7ff000ac8c75469ce8992a1f711bccf5759fbe/pycantonese-5.0.0-cp310-abi3-macosx_10_12_x86_64.whl", hash = "sha256:587387ffe61969d95a5ee5f3f47eb74712c50e76dbc00d578dfb59b45934e3f5", size = 42475866, upload-time = "2026-05-26T05:59:33.656Z" },
+    { url = "https://files.pythonhosted.org/packages/d8/a9/cbc19623761136d7c8f7230d633bc4735acf685f12da78662f4c24206bbf/pycantonese-5.0.0-cp310-abi3-macosx_11_0_arm64.whl", hash = "sha256:b33d794ea43c8bb7e18699e561fa51a0f48dfb5a033d569b99b733b6ffc30917", size = 42276871, upload-time = "2026-05-26T05:59:37.174Z" },
+    { url = "https://files.pythonhosted.org/packages/56/70/702c2edf2bd1dac56aef6236e30d977b83efe313e4a6b1ef9fa23004341a/pycantonese-5.0.0-cp310-abi3-manylinux_2_17_aarch64.manylinux2014_aarch64.whl", hash = "sha256:609d14a588cb0b39fe1644347609677dbda77e25978dfd34f1f9de455f88637b", size = 42602997, upload-time = "2026-05-26T05:59:40.259Z" },
+    { url = "https://files.pythonhosted.org/packages/ee/fe/ee179a7336935d71d1db34183008a5362457d657e59c7a4c63e20c0b7852/pycantonese-5.0.0-cp310-abi3-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:4a010973683fb8d14313ef44cdf7a4ded1adbe1a1bc64c93d0f75e65f141dd1a", size = 42676646, upload-time = "2026-05-26T05:59:43.28Z" },
+    { url = "https://files.pythonhosted.org/packages/f3/fd/c13baa1362c377552644f3558759fc4b87557a9d9e3f7a030b25b897bfe3/pycantonese-5.0.0-cp310-abi3-win_amd64.whl", hash = "sha256:8f7bdc1e9a37b5e164cd57f22aecae8532d4d0b74ff5b6f5e28480a657fa53f9", size = 42123344, upload-time = "2026-05-26T05:59:46.154Z" },
+]
+
+[[package]]
 name = "pycparser"
 version = "3.0"
 source = { registry = "https://pypi.org/simple" }
@@ -1233,6 +1295,15 @@ source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/c3/b2/bc9c9196916376152d655522fdcebac55e66de6603a76a02bca1b6414f6c/pygments-2.20.0.tar.gz", hash = "sha256:6757cd03768053ff99f3039c1a36d6c0aa0b263438fcab17520b30a303a82b5f", size = 4955991, upload-time = "2026-03-29T13:29:33.898Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/f4/7e/a72dd26f3b0f4f2bf1dd8923c85f7ceb43172af56d63c7383eb62b332364/pygments-2.20.0-py3-none-any.whl", hash = "sha256:81a9e26dd42fd28a23a2d169d86d7ac03b46e2f8b59ed4698fb4785f946d0176", size = 1231151, upload-time = "2026-03-29T13:29:30.038Z" },
+]
+
+[[package]]
+name = "pypinyin"
+version = "0.55.0"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/b4/a4/784cf98c09e0dc22776b0d7d8a4a5b761218bcae4608c2416ce1e167c8af/pypinyin-0.55.0.tar.gz", hash = "sha256:b5711b3a0c6f76e67408ec6b2e3c4987a3a806b7c528076e7c7b86fcf0eaa66b", size = 839836, upload-time = "2025-07-20T12:01:50.657Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/b9/7b/4cabc76fcc21c3c7d5c671d8783984d30ac9d3bb387c4ba784fca3cdfa3a/pypinyin-0.55.0-py2.py3-none-any.whl", hash = "sha256:d53b1e8ad2cdb815fb2cb604ed3123372f5a28c6f447571244aca36fc62a286f", size = 840203, upload-time = "2025-07-20T12:01:48.535Z" },
 ]
 
 [[package]]
@@ -1433,6 +1504,19 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/c0/8f/0722ca900cc807c13a6a0c696dacf35430f72e0ec571c4275d2371fca3e9/rich-15.0.0.tar.gz", hash = "sha256:edd07a4824c6b40189fb7ac9bc4c52536e9780fbbfbddf6f1e2502c31b068c36", size = 230680, upload-time = "2026-04-12T08:24:00.75Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/82/3b/64d4899d73f91ba49a8c18a8ff3f0ea8f1c1d75481760df8c68ef5235bf5/rich-15.0.0-py3-none-any.whl", hash = "sha256:33bd4ef74232fb73fe9279a257718407f169c09b78a87ad3d296f548e27de0bb", size = 310654, upload-time = "2026-04-12T08:24:02.83Z" },
+]
+
+[[package]]
+name = "rustling"
+version = "0.8.0"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/49/1c/1dfeec8ecc0ff0d70d2be4c34dee45078c4ee7706214320f49c13c8f24ab/rustling-0.8.0.tar.gz", hash = "sha256:04d769e50ff2c8b0bc5fb178f0a1dba578427b6a7d9027253366d1ac8922e1fd", size = 347788, upload-time = "2026-03-20T23:18:50.52Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/f3/e5/8dc326d9392f075b67daedd8ef2798c07670c847e4eaff7a99c9b7be441c/rustling-0.8.0-cp310-abi3-macosx_10_12_x86_64.whl", hash = "sha256:61982a84e6fd86e7d4f9216ab1fecfa908e58234350e72d311c0203bee0e2b51", size = 2908881, upload-time = "2026-03-20T23:18:41.541Z" },
+    { url = "https://files.pythonhosted.org/packages/c3/58/b9f98fa259c4fc6d207bf32b72903594e347c4902f62cc76eedad7d6ffea/rustling-0.8.0-cp310-abi3-macosx_11_0_arm64.whl", hash = "sha256:242dd1ae5436c8dffcfac53a4ef53b3a414ba660525f166c568f5835d9519409", size = 2710893, upload-time = "2026-03-20T23:18:43.79Z" },
+    { url = "https://files.pythonhosted.org/packages/b8/ee/25b826bea0cae86d5e15107658630705a93bd58cc0fc38fd1cbfc942b433/rustling-0.8.0-cp310-abi3-manylinux_2_17_aarch64.manylinux2014_aarch64.whl", hash = "sha256:e7a5a869dec90d7c1737a4f698763103155b9b15dce652907de25772b51d71f3", size = 3015972, upload-time = "2026-03-20T23:18:45.599Z" },
+    { url = "https://files.pythonhosted.org/packages/da/2b/751f023690043ac5c5f62b19506906651da9c27c1ce8afb6c760e23e70f4/rustling-0.8.0-cp310-abi3-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:321ef6768275c50bab28661d5d5c50747ccde33c138e3afa53281b5cb5ca628d", size = 3106500, upload-time = "2026-03-20T23:18:47.438Z" },
+    { url = "https://files.pythonhosted.org/packages/9d/63/a683d35eea2f1bc1d0ad69902d15f22697a51473e1c3d11e14cfbc995648/rustling-0.8.0-cp310-abi3-win_amd64.whl", hash = "sha256:24b89b166e621b26d1c7a7a32e2ed31343112a482647af6128eb61e989c1b9a8", size = 2532713, upload-time = "2026-03-20T23:18:49.214Z" },
 ]
 
 [[package]]
@@ -1665,6 +1749,9 @@ dependencies = [
     { name = "datasets" },
     { name = "jiwer" },
     { name = "openai-whisper" },
+    { name = "pronouncing" },
+    { name = "pycantonese" },
+    { name = "pypinyin" },
     { name = "rich" },
     { name = "soundfile" },
     { name = "torch" },
@@ -1677,6 +1764,9 @@ requires-dist = [
     { name = "datasets", specifier = ">=5.0.0" },
     { name = "jiwer", specifier = ">=4.0.0" },
     { name = "openai-whisper", specifier = ">=20250625" },
+    { name = "pronouncing", specifier = ">=0.3.0" },
+    { name = "pycantonese", specifier = ">=5.0.0" },
+    { name = "pypinyin", specifier = ">=0.55.0" },
     { name = "rich", specifier = ">=15.0.0" },
     { name = "soundfile", specifier = ">=0.14.0" },
     { name = "torch", specifier = ">=2.12.1" },
@@ -1841,4 +1931,13 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/8f/be/f9f7594e23b5b93affff0318e4593c1920331bcaefda326cabcad94296a1/yarl-1.24.2-cp314-cp314t-win_amd64.whl", hash = "sha256:a7624b1ca46ca5d7b864ef0d2f8efe3091454085ee1855b4e992314529972215", size = 102980, upload-time = "2026-05-19T21:30:59.735Z" },
     { url = "https://files.pythonhosted.org/packages/65/a4/ba80dccd3593ff1f01051a818694d07b58cb8232677ee9a22a5a1f93a9fc/yarl-1.24.2-cp314-cp314t-win_arm64.whl", hash = "sha256:e434a45ce2e7a947f951fc5a8944c8cc080b7e59f9c50ae80fd39107cf88126d", size = 91219, upload-time = "2026-05-19T21:31:01.934Z" },
     { url = "https://files.pythonhosted.org/packages/fd/4d/4b880086bd0d3e034d25647be1d830afc3e3f610e98c4ab3490af6b1b6d5/yarl-1.24.2-py3-none-any.whl", hash = "sha256:2783d9226db8797636cd6896e4de81feed252d1db72265686c9558d97a4d94b9", size = 53576, upload-time = "2026-05-19T21:31:03.909Z" },
+]
+
+[[package]]
+name = "zipp"
+version = "4.1.0"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/b9/d8/eab98a517c14134c0b2eb4e2387bc5f457334293ec5d2dd3857ec2966802/zipp-4.1.0.tar.gz", hash = "sha256:4cb57381f544315db7688e976e922a2b18cdb513d21cc194eb42232ba2a3e602", size = 26214, upload-time = "2026-05-18T20:08:57.967Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/3a/13/547360d81e6d88d58492968ffda9f9542854f11310ee556fef14260cc886/zipp-4.1.0-py3-none-any.whl", hash = "sha256:25ad4e16390cd314347dd8f1de67a2ac538ae658ed4ab9db16029c07c188e97f", size = 10238, upload-time = "2026-05-18T20:08:57.045Z" },
 ]
