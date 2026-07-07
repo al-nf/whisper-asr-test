@@ -45,21 +45,13 @@ LOCALES = [
         "locale": "pa_in",
         "lang": "pa"
     },
-    {
-        "locale": "ru_ru",
-        "lang": "ru"
-    },
-    {
-        "locale": "be_by",
-        "lang": "be"
-    },
 ]
 
 model_sizes = [
-    "tiny",
-    "base",
-    "small",
-    # "medium",
+    # "tiny",
+    # "base",
+    # "small",
+    "medium",
     # "large",
 ]
 
