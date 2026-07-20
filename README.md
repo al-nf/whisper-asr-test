@@ -42,3 +42,27 @@ uv run eval_llm_postprocess.py --llm-model large --llm-batch-size 2
 
 `large` is tight on VRAM alongside Whisper + batched KV cache — drop
 `--llm-batch-size` if you hit OOMs.
+
+### Triage beyond aggregate WER/CER
+
+Aggregate WER/CER (and even sample-level WER) can't distinguish "the LLM
+overwrote a word ASR already had right" from "ASR already had a real error
+and the LLM's fix just doesn't match the reference's exact wording." A
+handful of the latter (inherently ambiguous references, defensible
+rewordings) can dominate a small sample and make the approach look worse
+than it is. `analyze_llm_postprocess.py` word-aligns `ref`<->`raw_hyp` and
+`raw_hyp`<->`llm_hyp` (via jiwer edit-ops) so every individual LLM edit is
+classified by whether the *specific token it touched* was already correct:
+
+- **Broke correct word** — ASR had it right; the LLM overwrote it with
+  something wrong (the damning failure mode).
+- **Attempted fix** — ASR was already wrong there; the LLM tried to fix it
+  (may or may not match the reference exactly).
+- **Ungrounded insert** — the LLM added a word with no counterpart in the
+  raw ASR output at all (a rule-6 violation, even if the addition reads as
+  linguistically reasonable).
+
+```
+uv run analyze_llm_postprocess.py --run-dir ./logs/llm_postprocess
+uv run analyze_llm_postprocess.py --run-dir ./logs/llm_postprocess --show-examples 3
+```
