@@ -156,6 +156,7 @@ def summarize_locale(result: dict) -> dict:
     lang = result["lang"]
     totals = {"broke_correct": 0, "fix_matched": 0, "fix_unmatched": 0, "ungrounded_inserts": 0}
     samples_with_broke_correct = 0
+    format_noncompliant = 0
     deltas = []
     audits = []
     for row in result["rows"]:
@@ -167,6 +168,8 @@ def summarize_locale(result: dict) -> dict:
         totals["ungrounded_inserts"] += len(audit["ungrounded_inserts"])
         if audit["broke_correct"]:
             samples_with_broke_correct += 1
+        if row.get("format_noncompliant"):
+            format_noncompliant += 1
         deltas.append(row["sample_wer_raw"] - row["sample_wer_llm"])
 
     n = len(result["rows"])
@@ -175,6 +178,7 @@ def summarize_locale(result: dict) -> dict:
         "n": n,
         **totals,
         "samples_with_broke_correct": samples_with_broke_correct,
+        "format_noncompliant": format_noncompliant,
         "mean_delta": statistics.mean(deltas) if deltas else float("nan"),
         "median_delta": statistics.median(deltas) if deltas else float("nan"),
         "baseline_wer": result.get("baseline_wer"),
@@ -192,6 +196,7 @@ def render_summary_table(summaries: List[dict]) -> Table:
     table.add_column("Fix -> Still Wrong", justify="right")
     table.add_column("Ungrounded Insert", justify="right")
     table.add_column("Samples w/ Broke", justify="right")
+    table.add_column("Fmt Noncompliant", justify="right")
     table.add_column("Mean WER Δ", justify="right")
     for s in summaries:
         table.add_row(
@@ -202,9 +207,21 @@ def render_summary_table(summaries: List[dict]) -> Table:
             str(s["fix_unmatched"]),
             str(s["ungrounded_inserts"]),
             f"{s['samples_with_broke_correct']} ({s['samples_with_broke_correct'] / s['n']:.0%})",
+            f"{s['format_noncompliant']} ({s['format_noncompliant'] / s['n']:.0%})",
             f"{s['mean_delta']:+.4f}",
         )
     return table
+
+
+def _print_row_header(console: Console, row: dict) -> None:
+    console.print(f"[bold]ref[/bold]:     {row['ref']}")
+    console.print(f"[bold]raw_hyp[/bold]: {row['raw_hyp'].strip()}")
+    console.print(f"[bold]llm_hyp[/bold]: {row['llm_hyp'].strip()}")
+    if row.get("format_noncompliant"):
+        console.print(
+            "  [magenta]note: model leaked reasoning/notes here; llm_hyp is after fallback "
+            "extraction and may itself be unreliable[/magenta]"
+        )
 
 
 def print_examples(result: dict, audits: List[dict], k: int) -> None:
@@ -216,9 +233,7 @@ def print_examples(result: dict, audits: List[dict], k: int) -> None:
     if broke:
         console.rule(f"{result['locale']}: LLM overwrote an already-correct word (showing {min(k, len(broke))}/{len(broke)})")
         for row, audit in broke[:k]:
-            console.print(f"[bold]ref[/bold]:     {row['ref']}")
-            console.print(f"[bold]raw_hyp[/bold]: {row['raw_hyp'].strip()}")
-            console.print(f"[bold]llm_hyp[/bold]: {row['llm_hyp'].strip()}")
+            _print_row_header(console, row)
             for edit in audit["broke_correct"]:
                 console.print(f"  [red]{' '.join(edit['raw_span'])!r} -> {' '.join(edit['llm_span'])!r}[/red] (was correct)")
             console.print()
@@ -227,9 +242,7 @@ def print_examples(result: dict, audits: List[dict], k: int) -> None:
     if inserts:
         console.rule(f"{result['locale']}: LLM inserted words with no raw-token counterpart (showing {min(k, len(inserts))}/{len(inserts)})")
         for row, audit in inserts[:k]:
-            console.print(f"[bold]ref[/bold]:     {row['ref']}")
-            console.print(f"[bold]raw_hyp[/bold]: {row['raw_hyp'].strip()}")
-            console.print(f"[bold]llm_hyp[/bold]: {row['llm_hyp'].strip()}")
+            _print_row_header(console, row)
             for span in audit["ungrounded_inserts"]:
                 console.print(f"  [yellow]inserted: {' '.join(span)!r}[/yellow]")
             console.print()
@@ -239,9 +252,7 @@ def print_examples(result: dict, audits: List[dict], k: int) -> None:
     if matched:
         console.rule(f"{result['locale']}: LLM fix landed exactly on the reference (showing {min(k, len(matched))}/{len(matched)})")
         for row, audit in matched[:k]:
-            console.print(f"[bold]ref[/bold]:     {row['ref']}")
-            console.print(f"[bold]raw_hyp[/bold]: {row['raw_hyp'].strip()}")
-            console.print(f"[bold]llm_hyp[/bold]: {row['llm_hyp'].strip()}")
+            _print_row_header(console, row)
             for edit in audit["fix_matched"]:
                 console.print(f"  [green]{' '.join(edit['raw_span'])!r} -> {' '.join(edit['llm_span'])!r}[/green] (raw was wrong; llm now matches ref)")
             console.print()
@@ -251,9 +262,7 @@ def print_examples(result: dict, audits: List[dict], k: int) -> None:
     if unmatched:
         console.rule(f"{result['locale']}: LLM changed an already-wrong word but didn't land on the reference (showing {min(k, len(unmatched))}/{len(unmatched)})")
         for row, audit in unmatched[:k]:
-            console.print(f"[bold]ref[/bold]:     {row['ref']}")
-            console.print(f"[bold]raw_hyp[/bold]: {row['raw_hyp'].strip()}")
-            console.print(f"[bold]llm_hyp[/bold]: {row['llm_hyp'].strip()}")
+            _print_row_header(console, row)
             for edit in audit["fix_unmatched"]:
                 expected = " ".join(edit["expected_ref_span"]) or "(nothing - raw had an extra word)"
                 console.print(

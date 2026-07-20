@@ -50,6 +50,32 @@ Rules:
 6. Do not add any word, phrase, or entity that has no plausible phonetic or contextual relationship to a specific span in the ASR output, even if it is historically accurate or fits the topic. Every word in your output must trace back to either (a) an unedited ASR token, or (b) a phonetic correction of a specific ASR token.
 Output only the corrected text. No explanations, comments, or formatting."""
 
+# Some models (especially mid-sized ones reasoning through phonetic
+# ambiguity) leak their chain-of-thought - e.g. "Correction note: ...
+# Final Output: <text>" - despite the prompt's own "output only the
+# corrected text" rule. This system message exists purely to reinforce that
+# instruction; it doesn't add or change any of the correction rules above.
+STRICT_FORMAT_SYSTEM_PROMPT = (
+    "You strictly follow output-format instructions. When asked to output only "
+    "specific content, respond with exactly that and nothing else: no reasoning, "
+    "no notes, no preambles or sign-offs, and no labels like 'Correction note:', "
+    "'Final Output:', or 'Corrected transcript:'. Do the reasoning silently and "
+    "return only the final requested content."
+)
+
+# Fallback markers used to salvage a usable answer if a model leaks reasoning
+# anyway. If any of these appear, we take the text after the LAST match,
+# since models tend to state their true final answer last after "thinking
+# out loud" through the correction.
+FORMAT_LEAK_MARKERS = [
+    "final output:",
+    "final corrected transcript:",
+    "final corrected text:",
+    "final answer:",
+    "corrected transcript:",
+    "corrected text:",
+]
+
 
 LOCALES = {
     "en_us": {"locale": "en_us", "lang": "en"},
@@ -136,13 +162,34 @@ class LLMCorrector:
 
     def _build_chat_text(self, asr_text: str) -> str:
         prompt = CORRECTION_PROMPT_TEMPLATE.format(ASR_TEXT=asr_text)
-        messages = [{"role": "user", "content": prompt}]
+        messages = [
+            {"role": "system", "content": STRICT_FORMAT_SYSTEM_PROMPT},
+            {"role": "user", "content": prompt},
+        ]
         return self.tokenizer.apply_chat_template(
             messages, tokenize=False, add_generation_prompt=True
         )
 
+    @staticmethod
+    def _extract_final_answer(text: str) -> "tuple[str, bool]":
+        """Strip leaked reasoning/notes if the model violated the output-only
+        rule. Returns (cleaned_text, was_noncompliant)."""
+        stripped = text.strip()
+        lowered = stripped.lower()
+        best_idx, best_len = -1, 0
+        for marker in FORMAT_LEAK_MARKERS:
+            idx = lowered.rfind(marker)
+            if idx > best_idx:
+                best_idx, best_len = idx, len(marker)
+        if best_idx == -1:
+            return stripped, False
+        extracted = stripped[best_idx + best_len :].strip(' \n"`')
+        if not extracted:
+            return stripped, False
+        return extracted, True
+
     @torch.no_grad()
-    def correct_batch(self, texts: List[str]) -> List[str]:
+    def correct_batch(self, texts: List[str]) -> "tuple[List[str], List[bool]]":
         chat_texts = [self._build_chat_text(t) for t in texts]
         inputs = self.tokenizer(
             chat_texts, return_tensors="pt", padding=True, truncation=True
@@ -157,14 +204,21 @@ class LLMCorrector:
         )
         generated = output_ids[:, inputs["input_ids"].shape[1]:]
         decoded = self.tokenizer.batch_decode(generated, skip_special_tokens=True)
-        return [d.strip() for d in decoded]
+        cleaned, flags = [], []
+        for d in decoded:
+            text, noncompliant = self._extract_final_answer(d)
+            cleaned.append(text)
+            flags.append(noncompliant)
+        return cleaned, flags
 
-    def correct_all(self, texts: List[str], batch_size: int, desc: str) -> List[str]:
-        corrected = []
+    def correct_all(self, texts: List[str], batch_size: int, desc: str) -> "tuple[List[str], List[bool]]":
+        corrected, flags = [], []
         for i in tqdm(range(0, len(texts), batch_size), desc=desc, unit="batch"):
             batch = texts[i : i + batch_size]
-            corrected.extend(self.correct_batch(batch))
-        return corrected
+            batch_texts, batch_flags = self.correct_batch(batch)
+            corrected.extend(batch_texts)
+            flags.extend(batch_flags)
+        return corrected, flags
 
 
 def metric_or_nan(metric, refs: List[str], hyps: List[str]) -> float:
@@ -210,8 +264,9 @@ def evaluate_locale(
     asr_seconds = time.time() - start
 
     start = time.time()
-    llm_hyps = corrector.correct_all(raw_hyps, llm_batch_size, desc=f"LLM: {locale}")
+    llm_hyps, format_flags = corrector.correct_all(raw_hyps, llm_batch_size, desc=f"LLM: {locale}")
     llm_seconds = time.time() - start
+    format_noncompliance_rate = sum(format_flags) / len(format_flags) if format_flags else math.nan
 
     refs_clean = [normalize_text(r, lang) for r in refs]
     raw_clean = [normalize_text(h, lang) for h in raw_hyps]
@@ -228,6 +283,7 @@ def evaluate_locale(
             "ref": refs[i],
             "raw_hyp": raw_hyps[i],
             "llm_hyp": llm_hyps[i],
+            "format_noncompliant": format_flags[i],
             "sample_wer_raw": metric_or_nan(wer, [refs_clean[i]], [raw_clean[i]]),
             "sample_wer_llm": metric_or_nan(wer, [refs_clean[i]], [llm_clean[i]]),
         }
@@ -240,6 +296,7 @@ def evaluate_locale(
         "samples": len(refs),
         "baseline_wer": baseline_wer,
         "baseline_cer": baseline_cer,
+        "format_noncompliance_rate": format_noncompliance_rate,
         "llm_wer": llm_wer,
         "llm_cer": llm_cer,
         "wer_relative_improvement": relative_improvement(baseline_wer, llm_wer),
@@ -260,6 +317,7 @@ def render_table(results: List[dict]) -> Table:
     table.add_column("CER (raw)", justify="right")
     table.add_column("CER (llm)", justify="right")
     table.add_column("CER Δ", justify="right")
+    table.add_column("Fmt Noncompliance", justify="right")
     for r in results:
         table.add_row(
             r["locale"],
@@ -270,6 +328,7 @@ def render_table(results: List[dict]) -> Table:
             f"{r['baseline_cer']:.4f}",
             f"{r['llm_cer']:.4f}",
             f"{r['cer_relative_improvement']:+.1%}",
+            f"{r['format_noncompliance_rate']:.1%}",
         )
     return table
 
