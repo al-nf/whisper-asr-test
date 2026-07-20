@@ -63,18 +63,42 @@ STRICT_FORMAT_SYSTEM_PROMPT = (
     "return only the final requested content."
 )
 
+# Prepended to the model's turn so it starts already "mid-answer" instead of
+# free to reason first - a response-prefill trick. This is the primary
+# defense against reasoning leakage: markers below are a best-effort net for
+# whatever slips through, not a substitute for suppressing it up front.
+RESPONSE_PREFIX = "Corrected transcript: "
+
 # Fallback markers used to salvage a usable answer if a model leaks reasoning
 # anyway. If any of these appear, we take the text after the LAST match,
 # since models tend to state their true final answer last after "thinking
-# out loud" through the correction.
+# out loud" through the correction. This list can never be exhaustive -
+# models invent novel transition phrases (e.g. "the corrected version would
+# be") - so it's backed up by a length-ratio heuristic below rather than
+# relied on alone.
 FORMAT_LEAK_MARKERS = [
     "final output:",
     "final corrected transcript:",
     "final corrected text:",
     "final answer:",
+    "final result:",
     "corrected transcript:",
     "corrected text:",
+    "corrected version:",
+    "correct version:",
+    "corrected version would be",
+    "correction would be",
+    "corrected sentence would be",
+    "corrected text would be",
 ]
+
+# If the (possibly marker-extracted) candidate is still this many times
+# longer than the source ASR text, treat it as a failed extraction rather
+# than trust it - a single unrecovered reasoning dump can otherwise dominate
+# a whole locale's aggregate WER. We fall back to the uncorrected raw ASR
+# text in that case (i.e. "correction failed, count it as a no-op") instead
+# of scoring the reasoning blob as the hypothesis.
+LEAK_LENGTH_RATIO_THRESHOLD = 2.0
 
 
 LOCALES = {
@@ -136,7 +160,7 @@ class LLMCorrector:
         model_name: str,
         device: str = "cuda",
         load_in_4bit: bool = False,
-        max_new_tokens: int = 256,
+        max_new_tokens: int = 384,
     ):
         self.max_new_tokens = max_new_tokens
         self.tokenizer = AutoTokenizer.from_pretrained(model_name)
@@ -166,14 +190,20 @@ class LLMCorrector:
             {"role": "system", "content": STRICT_FORMAT_SYSTEM_PROMPT},
             {"role": "user", "content": prompt},
         ]
-        return self.tokenizer.apply_chat_template(
+        chat_text = self.tokenizer.apply_chat_template(
             messages, tokenize=False, add_generation_prompt=True
         )
+        # Response-prefill: the model's turn already "starts" mid-answer, so
+        # there's no room before the answer for it to reason out loud first.
+        return chat_text + RESPONSE_PREFIX
 
     @staticmethod
-    def _extract_final_answer(text: str) -> "tuple[str, bool]":
+    def _extract_final_answer(text: str, source_text: str) -> "tuple[str, bool]":
         """Strip leaked reasoning/notes if the model violated the output-only
-        rule. Returns (cleaned_text, was_noncompliant)."""
+        rule. Returns (cleaned_text, was_noncompliant). Falls back to the
+        uncorrected source text if the result still looks like a reasoning
+        dump (implausibly long relative to the input) rather than risk
+        scoring a leaked chain-of-thought as the hypothesis."""
         stripped = text.strip()
         lowered = stripped.lower()
         best_idx, best_len = -1, 0
@@ -181,12 +211,19 @@ class LLMCorrector:
             idx = lowered.rfind(marker)
             if idx > best_idx:
                 best_idx, best_len = idx, len(marker)
-        if best_idx == -1:
-            return stripped, False
-        extracted = stripped[best_idx + best_len :].strip(' \n"`')
-        if not extracted:
-            return stripped, False
-        return extracted, True
+
+        noncompliant = False
+        candidate = stripped
+        if best_idx != -1:
+            extracted = stripped[best_idx + best_len :].strip(' \n"`')
+            if extracted:
+                candidate, noncompliant = extracted, True
+
+        source_len = max(len(source_text.split()), 1)
+        if len(candidate.split()) > LEAK_LENGTH_RATIO_THRESHOLD * source_len:
+            return source_text.strip(), True
+
+        return candidate, noncompliant
 
     @torch.no_grad()
     def correct_batch(self, texts: List[str]) -> "tuple[List[str], List[bool]]":
@@ -205,8 +242,10 @@ class LLMCorrector:
         generated = output_ids[:, inputs["input_ids"].shape[1]:]
         decoded = self.tokenizer.batch_decode(generated, skip_special_tokens=True)
         cleaned, flags = [], []
-        for d in decoded:
-            text, noncompliant = self._extract_final_answer(d)
+        for source_text, d in zip(texts, decoded):
+            # The model's turn was prefilled with RESPONSE_PREFIX, so `d` is
+            # already just the continuation after it - no need to strip it back off.
+            text, noncompliant = self._extract_final_answer(d, source_text)
             cleaned.append(text)
             flags.append(noncompliant)
         return cleaned, flags
@@ -377,7 +416,16 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--max-samples", type=int, default=30)
     parser.add_argument("--llm-batch-size", type=int, default=8)
-    parser.add_argument("--max-new-tokens", type=int, default=256)
+    parser.add_argument(
+        "--max-new-tokens",
+        type=int,
+        default=384,
+        help=(
+            "Generation budget per sample. Kept generous since a model that "
+            "leaks reasoning despite the response-prefill trick still needs "
+            "room to reach its actual answer before truncating mid-sentence."
+        ),
+    )
     parser.add_argument(
         "--load-in-4bit",
         action="store_true",
