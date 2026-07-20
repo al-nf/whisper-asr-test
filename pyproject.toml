@@ -5,6 +5,7 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
+    "accelerate>=1.2.0",
     "datasets>=5.0.0",
     "jiwer>=4.0.0",
     "openai-whisper>=20250625",
@@ -16,4 +17,5 @@ dependencies = [
     "torch>=2.12.1",
     "torchcodec>=0.14.0",
     "tqdm>=4.68.3",
+    "transformers>=4.46.0",
 ]
