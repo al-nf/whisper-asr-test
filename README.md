@@ -56,11 +56,19 @@ classified by whether the *specific token it touched* was already correct:
 
 - **Broke correct word** — ASR had it right; the LLM overwrote it with
   something wrong (the damning failure mode).
-- **Attempted fix** — ASR was already wrong there; the LLM tried to fix it
-  (may or may not match the reference exactly).
+- **Fix → matches ref** — ASR was already wrong there, and the LLM's edit
+  landed exactly on what the reference says (a genuine, unambiguous win).
+- **Fix → still wrong** — ASR was already wrong there, and the LLM changed
+  it to a *different* wrong answer (didn't help, but didn't break anything
+  that was working either).
 - **Ungrounded insert** — the LLM added a word with no counterpart in the
   raw ASR output at all (a rule-6 violation, even if the addition reads as
   linguistically reasonable).
+
+Adjacent edits are merged into single units before matching (e.g. a raw
+two-word span collapsing into one corrected word, like `a parte` → `aparte`,
+is judged as one edit against the reference — not two separate "still wrong"
+half-edits).
 
 ```
 uv run analyze_llm_postprocess.py --run-dir ./logs/llm_postprocess
