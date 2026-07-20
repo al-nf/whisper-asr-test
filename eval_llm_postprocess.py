@@ -67,6 +67,19 @@ DEFAULT_LOCALES = ["en_us", "es_419", "fr_fr", "cmn_hans_cn"]
 
 DEFAULT_LLM_MODEL = "Qwen/Qwen2.5-7B-Instruct"
 
+# Convenience presets for --llm-model so capacity can be A/B tested without
+# memorizing repo IDs / VRAM settings. All fit on a single 24GB 3090:
+#   small  ~15GB bf16   - fast, but weak at obeying the strict correction rules
+#   medium ~9GB  int4   - big jump in instruction-following over small
+#   large  ~19GB int4   - closest local proxy to a frontier model; tight on
+#                         VRAM, so drop --llm-batch-size (e.g. to 2-4) if you
+#                         see OOMs, especially if Whisper is also loaded.
+MODEL_TIERS = {
+    "small": {"model": "Qwen/Qwen2.5-7B-Instruct", "load_in_4bit": False},
+    "medium": {"model": "Qwen/Qwen2.5-14B-Instruct", "load_in_4bit": True},
+    "large": {"model": "Qwen/Qwen2.5-32B-Instruct", "load_in_4bit": True},
+}
+
 
 def normalize_text(text: str, lang: str) -> str:
     if lang == "zh":
@@ -292,7 +305,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--llm-model",
         default=DEFAULT_LLM_MODEL,
-        help="HF model id for the local correction LLM (must fit on your GPU).",
+        help=(
+            "HF model id for the local correction LLM (must fit on your GPU), "
+            f"or a capacity preset: {', '.join(MODEL_TIERS)}."
+        ),
     )
     parser.add_argument(
         "--language-mode",
@@ -319,16 +335,33 @@ def main() -> None:
     run_dir = get_run_dir()
     print(f"Saving logs to: {run_dir}")
 
+    llm_model = args.llm_model
+    load_in_4bit = args.load_in_4bit
+    if llm_model in MODEL_TIERS:
+        preset = MODEL_TIERS[llm_model]
+        llm_model = preset["model"]
+        # An explicit --load-in-4bit always wins; otherwise use the preset's default.
+        load_in_4bit = args.load_in_4bit or preset["load_in_4bit"]
+
     print(f"Loading Whisper model: {args.asr_model}")
     whisper_model = whisper.load_model(args.asr_model)
 
-    print(f"Loading correction LLM: {args.llm_model}")
+    print(f"Loading correction LLM: {llm_model} (4bit={load_in_4bit})")
     corrector = LLMCorrector(
-        args.llm_model,
+        llm_model,
         device=args.device,
-        load_in_4bit=args.load_in_4bit,
+        load_in_4bit=load_in_4bit,
         max_new_tokens=args.max_new_tokens,
     )
+
+    run_config = {
+        "asr_model": args.asr_model,
+        "llm_model": llm_model,
+        "load_in_4bit": load_in_4bit,
+        "language_mode": args.language_mode,
+        "max_samples": args.max_samples,
+    }
+    save_json(os.path.join(run_dir, "run_config.json"), run_config)
 
     all_results = []
     for locale_key in args.locales:
@@ -349,6 +382,8 @@ def main() -> None:
                 language_mode=args.language_mode,
                 llm_batch_size=args.llm_batch_size,
             )
+            result["asr_model"] = args.asr_model
+            result["llm_model"] = llm_model
             all_results.append(result)
             save_json(
                 os.path.join(run_dir, f"{locale_cfg['locale']}.json"),
