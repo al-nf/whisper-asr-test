@@ -1,5 +1,15 @@
 # Dependencies
 ### [uv](https://docs.astral.sh/uv/)
+### [FFmpeg](https://ffmpeg.org/) (system package)
+`datasets`' audio decoding (used by every script that loads an HF audio
+dataset - `eval.py`, `eval_llm_postprocess.py`, `eval_aishell_ngram_fusion.py`)
+goes through `torchcodec`, which dynamically loads FFmpeg's shared libraries
+(`libavutil`/`libavcodec`/`libavformat`, versions 4-8 supported) at import
+time and raises `RuntimeError: Could not load libtorchcodec` if none are
+found. Install it via your system package manager, e.g.:
+```
+sudo apt-get install -y ffmpeg
+```
 
 # Usage
 `uv run eval.py`
@@ -152,8 +162,46 @@ uv run eval_aishell_ngram_fusion.py --nbest-cache ./logs/aishell_ngram_fusion/nb
 ```
 
 Default ASR model is `junsor/whisper-small-aishell`; pass `--asr-model` to use
-your own fine-tune. Results (per-condition CER/WER/RER, `nbest.json`,
-`run_config.json`) are saved under `./logs/aishell_ngram_fusion/`.
+your own fine-tune. `--dtype` defaults to `auto`, which resolves to `float16`
+on CUDA (roughly half the memory/time of `float32` for a beam-search-heavy
+workload like this — important on Jetson) and `float32` on CPU. Results
+(per-condition CER/WER/RER, `nbest.json`, `run_config.json`) are saved under
+`./logs/aishell_ngram_fusion/`.
+
+#### Jetson: crashes / resuming
+
+The ASR (N-best generation) stage is the only part that touches the GPU, and
+on Jetson it can hit:
+
+```
+RuntimeError: NVML_SUCCESS == r INTERNAL ASSERT FAILED at
+".../c10/cuda/CUDACachingAllocator.cpp":1319, please report a bug to PyTorch.
+```
+
+This is a [known PyTorch-on-Tegra issue](https://github.com/pytorch/pytorch/issues/185240):
+Jetson's unified memory needs a physically-contiguous DMA buffer (via NvMap)
+for each CUDA allocation, and under fragmentation/CMA pressure that
+allocation can fail; PyTorch then tries to query NVML for diagnostics, and
+NVML's partial Tegra support turns that into an uncatchable-looking internal
+assert instead of a normal `OutOfMemoryError`. The script mitigates this three
+ways:
+
+- Sets `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` automatically
+  (reduces allocator fragmentation, so the underlying failure is less likely
+  in the first place).
+- Catches the error around each ASR batch, frees the cache, and retries with
+  the batch recursively split in half (down to one utterance); a single
+  utterance that still fails is recorded with an empty hypothesis instead of
+  aborting the run.
+- **Checkpoints `nbest.json` after every batch**, keyed by utterance id. If
+  the process is still killed outright (OOM-killer, power event, etc.),
+  re-run with `--run-dir` pointing at the same directory and it resumes from
+  the last completed batch instead of restarting:
+  ```
+  uv run eval_aishell_ngram_fusion.py --run-dir ./logs/aishell_ngram_fusion
+  ```
+
+If crashes persist, lower `--batch-size` and/or `--num-beams` further.
 
 ### 5. Analyze: confirm or refute the hypothesis
 

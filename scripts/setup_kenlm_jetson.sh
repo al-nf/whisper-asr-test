@@ -40,7 +40,8 @@ sudo apt-get update
 sudo apt-get install -y \
     build-essential cmake \
     libboost-system-dev libboost-thread-dev libboost-program-options-dev libboost-test-dev \
-    libeigen3-dev zlib1g-dev libbz2-dev liblzma-dev
+    libeigen3-dev zlib1g-dev libbz2-dev liblzma-dev \
+    ffmpeg  # not kenlm-related, but datasets' torchcodec audio backend needs it - see README
 
 echo "== Cloning kenlm (for the lmplz/build_binary CLI tools) =="
 mkdir -p "${THIRD_PARTY_DIR}"

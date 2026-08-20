@@ -36,11 +36,29 @@ Usage:
     uv run eval_aishell_ngram_fusion.py
     uv run eval_aishell_ngram_fusion.py --max-samples 200 --num-beams 5
     uv run eval_aishell_ngram_fusion.py --nbest-cache ./logs/aishell_ngram_fusion/nbest.json
+
+Resuming after a crash (e.g. the Jetson NVML/CUDACachingAllocator assertion -
+see README): the ASR stage writes `nbest.json` into the run dir after *every*
+batch, not just at the end. Re-run with `--run-dir` pointing at the same
+directory and it will skip utterances already present in that file and pick
+up where it left off:
+    uv run eval_aishell_ngram_fusion.py --run-dir ./logs/aishell_ngram_fusion
 """
 
 import argparse
+import gc
 import json
 import os
+
+# Must be set before CUDA is initialized. On Jetson/Tegra, PyTorch's caching
+# allocator can hit contiguous-memory (CMA) exhaustion under repeated
+# alloc/free churn from beam search; when that happens it tries to query NVML
+# for diagnostics and NVML's partial Tegra support makes it crash with
+# `RuntimeError: NVML_SUCCESS == r INTERNAL ASSERT FAILED at
+# CUDACachingAllocator.cpp` instead of a catchable OOM. Expandable segments
+# reduce allocator fragmentation and make that failure far less likely.
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
 import random
 from typing import List, Optional
 
@@ -94,6 +112,117 @@ def tune_eval_split(n: int, tune_frac: float, seed: int) -> "tuple[List[int], Li
     return indices[:n_tune], indices[n_tune:]
 
 
+def _run_batch(
+    model,
+    processor,
+    device: str,
+    sub_dataset,
+    num_beams: int,
+    max_new_tokens: int,
+    language: str,
+    task: str,
+) -> List[dict]:
+    """Runs beam search on a single (small) chunk of the dataset. Raises on
+    failure - callers handle OOM-style retries."""
+    audio_arrays = [a["array"] for a in sub_dataset["audio"]]
+    inputs = processor(audio_arrays, sampling_rate=16000, return_tensors="pt")
+    input_features = inputs.input_features.to(device=device, dtype=model.dtype)
+
+    with torch.no_grad():
+        output = model.generate(
+            input_features,
+            num_beams=num_beams,
+            num_return_sequences=num_beams,
+            output_scores=True,
+            return_dict_in_generate=True,
+            max_new_tokens=max_new_tokens,
+            language=language,
+            task=task,
+        )
+
+    texts = processor.batch_decode(output.sequences, skip_special_tokens=True)
+    scores = output.sequences_scores.tolist()
+
+    out = []
+    for i in range(len(audio_arrays)):
+        item_texts = texts[i * num_beams : (i + 1) * num_beams]
+        item_scores = scores[i * num_beams : (i + 1) * num_beams]
+        seen = {}
+        for text, score in zip(item_texts, item_scores):
+            norm = normalize_zh_text(text)
+            if norm not in seen or score > seen[norm]:
+                seen[norm] = score
+        candidates = sorted(
+            ({"text": t, "acoustic_avg_logprob": s} for t, s in seen.items()),
+            key=lambda c: c["acoustic_avg_logprob"],
+            reverse=True,
+        )
+        out.append(
+            {
+                "utt_id": sub_dataset["name"][i],
+                "ref": normalize_zh_text(sub_dataset["text"][i]),
+                "candidates": candidates,
+            }
+        )
+    return out
+
+
+_RECOVERABLE_ERROR_MARKERS = (
+    "CUDA out of memory",
+    "out of memory",
+    "NVML_SUCCESS",
+    "CUDACachingAllocator",
+    "NvMap",
+)
+
+
+def _is_recoverable_cuda_error(exc: BaseException) -> bool:
+    msg = str(exc)
+    return any(marker in msg for marker in _RECOVERABLE_ERROR_MARKERS)
+
+
+def _run_batch_with_retry(
+    model,
+    processor,
+    device: str,
+    sub_dataset,
+    num_beams: int,
+    max_new_tokens: int,
+    language: str,
+    task: str,
+) -> List[dict]:
+    """Runs `_run_batch`, and on a CUDA OOM / Jetson NVML-allocator error
+    (see module docstring), frees memory and retries with the batch split in
+    half - down to single utterances. A single utterance that still fails
+    is recorded with an empty hypothesis rather than aborting the whole run."""
+    try:
+        return _run_batch(model, processor, device, sub_dataset, num_beams, max_new_tokens, language, task)
+    except RuntimeError as e:
+        if not _is_recoverable_cuda_error(e):
+            raise
+        gc.collect()
+        if device.startswith("cuda") and torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        n = len(sub_dataset)
+        if n <= 1:
+            utt_id = sub_dataset["name"][0]
+            tqdm.write(f"  [warn] utt_id={utt_id} failed even at batch size 1 ({e}); recording empty hypothesis.")
+            return [
+                {
+                    "utt_id": utt_id,
+                    "ref": normalize_zh_text(sub_dataset["text"][0]),
+                    "candidates": [{"text": "", "acoustic_avg_logprob": 0.0}],
+                }
+            ]
+        mid = n // 2
+        tqdm.write(f"  [warn] batch of {n} failed ({type(e).__name__}: {e}); splitting into {mid}+{n - mid} and retrying.")
+        left = sub_dataset.select(range(0, mid))
+        right = sub_dataset.select(range(mid, n))
+        return _run_batch_with_retry(
+            model, processor, device, left, num_beams, max_new_tokens, language, task
+        ) + _run_batch_with_retry(model, processor, device, right, num_beams, max_new_tokens, language, task)
+
+
 def generate_nbest(
     dataset,
     model,
@@ -104,55 +233,40 @@ def generate_nbest(
     batch_size: int,
     language: str,
     task: str,
+    checkpoint_path: Optional[str] = None,
 ) -> List[dict]:
     """Runs Whisper beam search once per utterance, keeping the top `num_beams`
     candidates and their length-normalized acoustic log-probs. This is the
     only step that touches the GPU/model - everything downstream (rescoring,
-    alpha tuning, metric computation) operates on this cached output."""
-    results = []
-    for start in tqdm(range(0, len(dataset), batch_size), desc="ASR N-best", unit="batch"):
-        batch = dataset[start : start + batch_size]
-        audio_arrays = [a["array"] for a in batch["audio"]]
-        inputs = processor(audio_arrays, sampling_rate=16000, return_tensors="pt")
-        input_features = inputs.input_features.to(device=device, dtype=model.dtype)
+    alpha tuning, metric computation) operates on this cached output.
 
-        with torch.no_grad():
-            output = model.generate(
-                input_features,
-                num_beams=num_beams,
-                num_return_sequences=num_beams,
-                output_scores=True,
-                return_dict_in_generate=True,
-                max_new_tokens=max_new_tokens,
-                language=language,
-                task=task,
-            )
+    If `checkpoint_path` is given, results are written after every batch
+    (keyed by utt_id, so order-independent), and any utterances already
+    present there at startup are skipped - i.e. re-running with the same
+    `checkpoint_path` after a crash resumes instead of starting over."""
+    full_names = list(dataset["name"])
+    results_by_id: "dict[str, dict]" = {}
+    if checkpoint_path and os.path.exists(checkpoint_path):
+        with open(checkpoint_path, "r", encoding="utf-8") as f:
+            for item in json.load(f):
+                results_by_id[item["utt_id"]] = item
+        print(f"Resuming from checkpoint: {len(results_by_id)}/{len(full_names)} utterances already done.")
 
-        texts = processor.batch_decode(output.sequences, skip_special_tokens=True)
-        scores = output.sequences_scores.tolist()
+    remaining_indices = [i for i, name in enumerate(full_names) if name not in results_by_id]
+    if remaining_indices:
+        subset = dataset.select(remaining_indices)
+        n_batches = (len(subset) + batch_size - 1) // batch_size
+        for b in tqdm(range(n_batches), desc="ASR N-best", unit="batch"):
+            start = b * batch_size
+            end = min(start + batch_size, len(subset))
+            sub = subset.select(range(start, end))
+            for item in _run_batch_with_retry(model, processor, device, sub, num_beams, max_new_tokens, language, task):
+                results_by_id[item["utt_id"]] = item
+            if checkpoint_path:
+                ordered_so_far = [results_by_id[name] for name in full_names if name in results_by_id]
+                save_json(checkpoint_path, ordered_so_far)
 
-        n_items = len(audio_arrays)
-        for i in range(n_items):
-            item_texts = texts[i * num_beams : (i + 1) * num_beams]
-            item_scores = scores[i * num_beams : (i + 1) * num_beams]
-            seen = {}
-            for text, score in zip(item_texts, item_scores):
-                norm = normalize_zh_text(text)
-                if norm not in seen or score > seen[norm]:
-                    seen[norm] = score
-            candidates = sorted(
-                ({"text": t, "acoustic_avg_logprob": s} for t, s in seen.items()),
-                key=lambda c: c["acoustic_avg_logprob"],
-                reverse=True,
-            )
-            results.append(
-                {
-                    "utt_id": batch["name"][i],
-                    "ref": normalize_zh_text(batch["text"][i]),
-                    "candidates": candidates,
-                }
-            )
-    return results
+    return [results_by_id[name] for name in full_names]
 
 
 def load_scorers(lm_dir: str, schemes: List[str], orders: List[int]) -> "dict[tuple, KenLMScorer]":
@@ -272,7 +386,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--orders", nargs="+", type=int, default=DEFAULT_ORDERS)
     parser.add_argument("--schemes", nargs="+", choices=list(TOKENIZERS), default=DEFAULT_SCHEMES)
     parser.add_argument("--alpha-grid", nargs="+", type=float, default=DEFAULT_ALPHA_GRID)
-    parser.add_argument("--num-beams", type=int, default=10, help="Beam width == N-best size.")
+    parser.add_argument("--num-beams", type=int, default=5, help="Beam width == N-best size.")
     parser.add_argument("--max-new-tokens", type=int, default=48)
     parser.add_argument("--batch-size", type=int, default=4)
     parser.add_argument("--max-samples", type=int, default=None, help="Subsample the test set (for quick iteration).")
@@ -281,22 +395,56 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--language", default="chinese")
     parser.add_argument("--task", default="transcribe")
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
-    parser.add_argument("--dtype", choices=list(DTYPE_MAP), default="float32")
+    parser.add_argument(
+        "--dtype",
+        choices=list(DTYPE_MAP) + ["auto"],
+        default="auto",
+        help="'auto' resolves to float16 on cuda (much faster/lighter on Jetson) or float32 on cpu.",
+    )
+    parser.add_argument(
+        "--run-dir",
+        default=None,
+        help="Use this directory instead of auto-numbering a new one. Required to resume a crashed run: "
+        "the ASR stage checkpoints nbest.json here after every batch and skips utterances already in it.",
+    )
     parser.add_argument(
         "--nbest-cache",
         default=None,
-        help="Path to a previously saved nbest.json - skips loading Whisper / running ASR entirely.",
+        help="Path to a previously saved (complete) nbest.json - skips loading Whisper / running ASR entirely.",
     )
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
-    run_dir = get_run_dir()
+    if args.run_dir:
+        run_dir = args.run_dir
+        os.makedirs(run_dir, exist_ok=True)
+    else:
+        run_dir = get_run_dir()
     print(f"Saving logs to: {run_dir}")
 
+    dtype_name = "float16" if args.dtype == "auto" and args.device.startswith("cuda") else args.dtype
+    if dtype_name == "auto":
+        dtype_name = "float32"
+
     run_config = vars(args).copy()
-    save_json(os.path.join(run_dir, "run_config.json"), run_config)
+    run_config["resolved_dtype"] = dtype_name
+
+    run_config_path = os.path.join(run_dir, "run_config.json")
+    if os.path.exists(run_config_path) and os.path.exists(os.path.join(run_dir, "nbest.json")):
+        with open(run_config_path, "r", encoding="utf-8") as f:
+            prev_config = json.load(f)
+        generation_keys = ["asr_model", "num_beams", "max_new_tokens", "language", "task", "resolved_dtype"]
+        mismatches = [k for k in generation_keys if prev_config.get(k) != run_config.get(k)]
+        if mismatches:
+            print(
+                f"[warn] Resuming into {run_dir}, but these generation-affecting settings differ from the "
+                f"previous run: {mismatches}. The resumed nbest.json would mix candidates generated under "
+                "different settings - use a fresh --run-dir (or match the previous settings) instead."
+            )
+
+    save_json(run_config_path, run_config)
 
     if args.nbest_cache:
         print(f"Loading cached N-best from {args.nbest_cache}")
@@ -308,13 +456,19 @@ def main() -> None:
         if args.max_samples is not None:
             dataset = dataset.select(range(min(args.max_samples, len(dataset))))
 
-        print(f"Loading ASR model: {args.asr_model} (device={args.device}, dtype={args.dtype})")
+        print(f"Loading ASR model: {args.asr_model} (device={args.device}, dtype={dtype_name})")
         processor = WhisperProcessor.from_pretrained(args.asr_model)
-        model = WhisperForConditionalGeneration.from_pretrained(
-            args.asr_model, torch_dtype=DTYPE_MAP[args.dtype]
-        ).to(args.device)
+        try:
+            model = WhisperForConditionalGeneration.from_pretrained(
+                args.asr_model, torch_dtype=DTYPE_MAP[dtype_name], attn_implementation="sdpa"
+            ).to(args.device)
+        except (ImportError, ValueError):
+            model = WhisperForConditionalGeneration.from_pretrained(
+                args.asr_model, torch_dtype=DTYPE_MAP[dtype_name]
+            ).to(args.device)
         model.eval()
 
+        checkpoint_path = os.path.join(run_dir, "nbest.json")
         nbest = generate_nbest(
             dataset,
             model,
@@ -325,8 +479,9 @@ def main() -> None:
             batch_size=args.batch_size,
             language=args.language,
             task=args.task,
+            checkpoint_path=checkpoint_path,
         )
-        save_json(os.path.join(run_dir, "nbest.json"), nbest)
+        save_json(checkpoint_path, nbest)
 
     tune_idx, eval_idx = tune_eval_split(len(nbest), args.tune_frac, args.seed)
     print(f"tune={len(tune_idx)} eval={len(eval_idx)} utterances")
