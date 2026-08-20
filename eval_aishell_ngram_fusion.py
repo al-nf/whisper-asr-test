@@ -15,7 +15,9 @@ fragile and hard to validate. Instead:
   1. Generate K beam candidates per utterance from Whisper alone, keeping each
      candidate's length-normalized acoustic log-prob (`sequences_scores`).
   2. Tokenize every candidate under a given scheme (char or jieba word) and
-     score it with the matching KenLM n-gram model (order 1-5).
+     score it with the matching KenLM n-gram model (order 2-5; order 1 is
+     excluded since KenLM can't load a unigram-only model - see
+     scripts/build_kenlm_models.sh).
   3. Re-rank candidates by `acoustic_avg_logprob + alpha * lm_avg_logprob` and
      take the top one. `alpha` is grid-searched on a held-out "tune" subset of
      the test set (there is no separate dev-set audio in this dataset mirror)
@@ -54,7 +56,12 @@ from ngram_lm import KenLMScorer, TOKENIZERS, normalize_zh_text
 
 DATASET_REPO = "Serenalay/AISHELL-1"
 DEFAULT_ASR_MODEL = "junsor/whisper-small-aishell"
-DEFAULT_ORDERS = [1, 2, 3, 4, 5]
+# Order 1 is excluded: KenLM's query/loading code hard-requires at least a
+# bigram model ("This ngram implementation assumes at least a bigram model")
+# even though lmplz can technically produce a unigram ARPA file - see
+# scripts/build_kenlm_models.sh. The no-LM beam-search baseline computed
+# below already serves as the effective "0th order" comparison point.
+DEFAULT_ORDERS = [2, 3, 4, 5]
 DEFAULT_SCHEMES = ["char", "word"]
 DEFAULT_ALPHA_GRID = [0.0, 0.1, 0.2, 0.3, 0.5, 0.7, 1.0, 1.5, 2.0]
 

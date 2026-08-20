@@ -80,9 +80,12 @@ uv run analyze_llm_postprocess.py --run-dir ./logs/llm_postprocess --show-exampl
 **Hypothesis:** WhisperLM-style fusion typically uses a 5-gram LM (tuned for
 space-delimited languages). Mandarin's character/word statistics may instead
 favor a much lower order (bigram/trigram) — this experiment measures the
-relative error-rate reduction (RER) from fusing orders 1-5 with a fine-tuned
+relative error-rate reduction (RER) from fusing orders 2-5 with a fine-tuned
 Whisper on AISHELL-1, separately for character-segmented and jieba
-word-segmented LMs, to confirm or refute that.
+word-segmented LMs, to confirm or refute that. (Order 1 is excluded: KenLM's
+query/loading code hard-requires at least a bigram model, even though
+`lmplz` can technically produce a unigram ARPA file. The no-LM beam-search
+baseline already serves as the effective "0th order" comparison point.)
 
 **Fusion mechanism: N-best rescoring, not shallow fusion during beam search.**
 Whisper's BPE tokens don't align to Chinese characters or jieba words, so
@@ -130,7 +133,7 @@ uv run prepare_aishell_lm_corpus.py
 
 ### 3. Train the KenLM models
 
-Trains orders 1-5 for both schemes (10 models total) with `lmplz` +
+Trains orders 2-5 for both schemes (8 models total) with `lmplz` +
 `build_binary`:
 
 ```
