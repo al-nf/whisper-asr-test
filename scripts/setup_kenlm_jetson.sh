@@ -5,9 +5,14 @@
 #   1. The KenLM CLI tools (`lmplz`, `build_binary`) under
 #      third_party/kenlm/build/bin - used by build_kenlm_models.sh to
 #      *train* the n-gram models from text.
-#   2. The `kenlm` Python package (query bindings only) in the current
-#      Python environment - used by ngram_lm.py to *score* candidates at
-#      eval time.
+#   2. The `kenlm` Python package (query bindings only) installed into this
+#      repo's uv-managed virtualenv (./.venv) - used by ngram_lm.py to
+#      *score* candidates at eval time. Deliberately NOT installed with plain
+#      `pip install` into the system Python: Debian/Ubuntu (incl. Jetson
+#      L4T) marks the system Python as "externally managed" (PEP 668) and
+#      will refuse it - and even if it didn't, `uv run` would still use the
+#      project venv, not the system site-packages, so kenlm would be
+#      invisible to eval_aishell_ngram_fusion.py anyway.
 #
 # Usage:
 #   bash scripts/setup_kenlm_jetson.sh
@@ -16,7 +21,8 @@
 set -euo pipefail
 
 KENLM_MAX_ORDER="${KENLM_MAX_ORDER:-6}"  # must be >= the highest n-gram order you'll train (we use up to 5)
-THIRD_PARTY_DIR="${THIRD_PARTY_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/third_party}"
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+THIRD_PARTY_DIR="${THIRD_PARTY_DIR:-${REPO_ROOT}/third_party}"
 KENLM_SRC_DIR="${THIRD_PARTY_DIR}/kenlm"
 
 echo "== Installing build dependencies (apt) =="
@@ -42,11 +48,15 @@ echo "== CLI tools built: =="
 echo "  lmplz:        ${KENLM_SRC_DIR}/build/bin/lmplz"
 echo "  build_binary: ${KENLM_SRC_DIR}/build/bin/build_binary"
 
-echo "== Installing the kenlm Python bindings (MAX_ORDER=${KENLM_MAX_ORDER}) =="
-MAX_ORDER="${KENLM_MAX_ORDER}" pip install "https://github.com/kpu/kenlm/archive/master.zip"
+echo "== Ensuring the project virtualenv exists (uv sync) =="
+( cd "${REPO_ROOT}" && uv sync )
+VENV_PYTHON="${REPO_ROOT}/.venv/bin/python"
+
+echo "== Installing the kenlm Python bindings into ${VENV_PYTHON} (MAX_ORDER=${KENLM_MAX_ORDER}) =="
+MAX_ORDER="${KENLM_MAX_ORDER}" uv pip install --python "${VENV_PYTHON}" "https://github.com/kpu/kenlm/archive/master.zip"
 
 echo "== Verifying the Python bindings import =="
-python3 -c "import kenlm; print('kenlm python module OK, version file:', kenlm.__file__)"
+"${VENV_PYTHON}" -c "import kenlm; print('kenlm python module OK, version file:', kenlm.__file__)"
 
 cat <<EOF
 
