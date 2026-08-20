@@ -1,0 +1,59 @@
+#!/usr/bin/env bash
+# One-time setup of KenLM on a Jetson AGX Orin (aarch64, Ubuntu/L4T).
+#
+# Produces two things:
+#   1. The KenLM CLI tools (`lmplz`, `build_binary`) under
+#      third_party/kenlm/build/bin - used by build_kenlm_models.sh to
+#      *train* the n-gram models from text.
+#   2. The `kenlm` Python package (query bindings only) in the current
+#      Python environment - used by ngram_lm.py to *score* candidates at
+#      eval time.
+#
+# Usage:
+#   bash scripts/setup_kenlm_jetson.sh
+#
+# Safe to re-run; it skips steps that already succeeded.
+set -euo pipefail
+
+KENLM_MAX_ORDER="${KENLM_MAX_ORDER:-6}"  # must be >= the highest n-gram order you'll train (we use up to 5)
+THIRD_PARTY_DIR="${THIRD_PARTY_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/third_party}"
+KENLM_SRC_DIR="${THIRD_PARTY_DIR}/kenlm"
+
+echo "== Installing build dependencies (apt) =="
+sudo apt-get update
+sudo apt-get install -y \
+    build-essential cmake \
+    libboost-system-dev libboost-thread-dev libboost-program-options-dev libboost-test-dev \
+    libeigen3-dev zlib1g-dev libbz2-dev liblzma-dev
+
+echo "== Cloning kenlm (for the lmplz/build_binary CLI tools) =="
+mkdir -p "${THIRD_PARTY_DIR}"
+if [ ! -d "${KENLM_SRC_DIR}" ]; then
+    git clone https://github.com/kpu/kenlm.git "${KENLM_SRC_DIR}"
+fi
+
+echo "== Building kenlm CLI tools via cmake =="
+mkdir -p "${KENLM_SRC_DIR}/build"
+cd "${KENLM_SRC_DIR}/build"
+cmake ..
+make -j"$(nproc)"
+
+echo "== CLI tools built: =="
+echo "  lmplz:        ${KENLM_SRC_DIR}/build/bin/lmplz"
+echo "  build_binary: ${KENLM_SRC_DIR}/build/bin/build_binary"
+
+echo "== Installing the kenlm Python bindings (MAX_ORDER=${KENLM_MAX_ORDER}) =="
+MAX_ORDER="${KENLM_MAX_ORDER}" pip install "https://github.com/kpu/kenlm/archive/master.zip"
+
+echo "== Verifying the Python bindings import =="
+python3 -c "import kenlm; print('kenlm python module OK, version file:', kenlm.__file__)"
+
+cat <<EOF
+
+Setup complete.
+
+Next steps:
+  export KENLM_BIN_DIR="${KENLM_SRC_DIR}/build/bin"
+  uv run prepare_aishell_lm_corpus.py
+  bash scripts/build_kenlm_models.sh
+EOF

@@ -74,3 +74,102 @@ half-edits).
 uv run analyze_llm_postprocess.py --run-dir ./logs/llm_postprocess
 uv run analyze_llm_postprocess.py --run-dir ./logs/llm_postprocess --show-examples 3
 ```
+
+## AISHELL-1 n-gram order/tokenization fusion test
+
+**Hypothesis:** WhisperLM-style fusion typically uses a 5-gram LM (tuned for
+space-delimited languages). Mandarin's character/word statistics may instead
+favor a much lower order (bigram/trigram) — this experiment measures the
+relative error-rate reduction (RER) from fusing orders 1-5 with a fine-tuned
+Whisper on AISHELL-1, separately for character-segmented and jieba
+word-segmented LMs, to confirm or refute that.
+
+**Fusion mechanism: N-best rescoring, not shallow fusion during beam search.**
+Whisper's BPE tokens don't align to Chinese characters or jieba words, so
+injecting an n-gram score at every decoding step would require guessing
+character/word boundaries inside a partially generated BPE token. Instead:
+Whisper generates K beam candidates per utterance (with their own
+length-normalized acoustic log-probs); each candidate is tokenized under a
+scheme (char or jieba word) and scored by the matching KenLM n-gram model;
+candidates are re-ranked by `acoustic + alpha * lm` and the top one is kept.
+`alpha` is grid-searched on a held-out 20% "tune" slice of the AISHELL-1 test
+set (there's no separate dev-set audio in the dataset mirror used here) and
+applied to the disjoint 80% "eval" slice that RER is computed on.
+
+### 1. Set up KenLM (Jetson AGX Orin)
+
+KenLM isn't declared in `pyproject.toml` — the PyPI sdist bundles a stale
+generated Cython file that fails to build against Python 3.13's C API, and
+the CLI tools (`lmplz`/`build_binary`) used to *train* n-gram models aren't
+part of the Python package at all. `scripts/setup_kenlm_jetson.sh` installs
+the apt build deps (Boost, Eigen, zlib/bz2/lzma), builds `lmplz`/`build_binary`
+from source via cmake, and installs the `kenlm` Python query bindings from
+GitHub (not PyPI) with `MAX_ORDER=6`:
+
+```
+bash scripts/setup_kenlm_jetson.sh
+export KENLM_BIN_DIR=third_party/kenlm/build/bin
+```
+
+### 2. Build the LM training corpora
+
+Downloads only the AISHELL-1 transcript file (no audio) from `AISHELL/AISHELL-1`,
+excludes every utterance id present in the `Serenalay/AISHELL-1` test split
+(the split step 4 evaluates on, so the LM never sees test transcripts), and
+writes char- and jieba-word-tokenized corpora from the remaining train+dev
+transcripts:
+
+```
+uv run prepare_aishell_lm_corpus.py
+```
+
+### 3. Train the KenLM models
+
+Trains orders 1-5 for both schemes (10 models total) with `lmplz` +
+`build_binary`:
+
+```
+bash scripts/build_kenlm_models.sh
+```
+
+### 4. Run the fusion eval
+
+Runs Whisper N-best generation once (cached to `nbest.json` in the run dir),
+then rescoring + alpha tuning for every (order, scheme) pair:
+
+```
+uv run eval_aishell_ngram_fusion.py
+uv run eval_aishell_ngram_fusion.py --max-samples 200 --num-beams 5   # quick iteration
+uv run eval_aishell_ngram_fusion.py --nbest-cache ./logs/aishell_ngram_fusion/nbest.json  # re-tune without re-running ASR
+```
+
+Default ASR model is `junsor/whisper-small-aishell`; pass `--asr-model` to use
+your own fine-tune. Results (per-condition CER/WER/RER, `nbest.json`,
+`run_config.json`) are saved under `./logs/aishell_ngram_fusion/`.
+
+### 5. Analyze: confirm or refute the hypothesis
+
+Computes RER per order/scheme, a paired bootstrap CI and P(no improvement)
+per condition, and an explicit verdict on whether the tied-best order set
+includes 2 or 3 (hypothesis supported) or not (refuted):
+
+```
+uv run analyze_aishell_ngram_fusion.py --run-dir ./logs/aishell_ngram_fusion
+```
+
+### Methodology notes
+
+- **Metric.** Alpha is always tuned to minimize CER (segmentation-tool
+  independent, the standard metric for Chinese) for *both* schemes, so
+  RER(CER) is directly comparable across char vs. word conditions. Jieba-based
+  WER (re-segmenting both ref and hyp with the same tokenizer — not the
+  dataset's own pre-baked word boundaries) is reported per condition as a
+  secondary diagnostic, using that same CER-tuned alpha.
+- **RER.** `(baseline_error - condition_error) / baseline_error`, computed on
+  the eval slice; `alpha=0` reproduces the no-LM baseline for every order as a
+  built-in sanity check.
+- **Significance.** `analyze_aishell_ngram_fusion.py` runs a paired bootstrap
+  (utterance-level resampling with replacement, recomputing corpus-level CER
+  per resample) to distinguish "order 2 is nominally best" from "order 2 is
+  significantly best" — orders whose CER-gap CI against the best order
+  includes 0 are reported as statistically tied.

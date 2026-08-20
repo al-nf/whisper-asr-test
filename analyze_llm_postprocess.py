@@ -152,11 +152,24 @@ def word_level_audit(ref: str, raw_hyp: str, llm_hyp: str, lang: str) -> dict:
     }
 
 
+def select_metric(result: dict) -> str:
+    """WER degenerates for zh/yue: normalize_text produces a whitespace-free
+    string, so jiwer.wer treats the whole sentence as one token - a
+    near-binary "exact match or not" per sample. CER is the metric that
+    actually carries signal for character-based languages. Falls back to
+    WER if a run predates per-sample CER tracking."""
+    rows = result.get("rows") or []
+    has_cer = bool(rows) and "sample_cer_raw" in rows[0]
+    return "cer" if result.get("lang") == "zh" and has_cer else "wer"
+
+
 def summarize_locale(result: dict) -> dict:
     lang = result["lang"]
     totals = {"broke_correct": 0, "fix_matched": 0, "fix_unmatched": 0, "ungrounded_inserts": 0}
     samples_with_broke_correct = 0
     format_noncompliant = 0
+    metric = select_metric(result)
+
     deltas = []
     audits = []
     for row in result["rows"]:
@@ -170,7 +183,7 @@ def summarize_locale(result: dict) -> dict:
             samples_with_broke_correct += 1
         if row.get("format_noncompliant"):
             format_noncompliant += 1
-        deltas.append(row["sample_wer_raw"] - row["sample_wer_llm"])
+        deltas.append(row[f"sample_{metric}_raw"] - row[f"sample_{metric}_llm"])
 
     n = len(result["rows"])
     return {
@@ -179,6 +192,7 @@ def summarize_locale(result: dict) -> dict:
         **totals,
         "samples_with_broke_correct": samples_with_broke_correct,
         "format_noncompliant": format_noncompliant,
+        "metric": metric,
         "mean_delta": statistics.mean(deltas) if deltas else float("nan"),
         "median_delta": statistics.median(deltas) if deltas else float("nan"),
         "baseline_wer": result.get("baseline_wer"),
@@ -197,7 +211,8 @@ def render_summary_table(summaries: List[dict]) -> Table:
     table.add_column("Ungrounded Insert", justify="right")
     table.add_column("Samples w/ Broke", justify="right")
     table.add_column("Fmt Noncompliant", justify="right")
-    table.add_column("Mean WER Δ", justify="right")
+    table.add_column("Metric", justify="left")
+    table.add_column("Mean Δ", justify="right")
     for s in summaries:
         table.add_row(
             s["locale"],
@@ -208,6 +223,7 @@ def render_summary_table(summaries: List[dict]) -> Table:
             str(s["ungrounded_inserts"]),
             f"{s['samples_with_broke_correct']} ({s['samples_with_broke_correct'] / s['n']:.0%})",
             f"{s['format_noncompliant']} ({s['format_noncompliant'] / s['n']:.0%})",
+            s["metric"].upper(),
             f"{s['mean_delta']:+.4f}",
         )
     return table

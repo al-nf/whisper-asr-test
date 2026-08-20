@@ -620,6 +620,12 @@ wheels = [
 ]
 
 [[package]]
+name = "jieba"
+version = "0.42.1"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/c6/cb/18eeb235f833b726522d7ebed54f2278ce28ba9438e3135ab0278d9792a2/jieba-0.42.1.tar.gz", hash = "sha256:055ca12f62674fafed09427f176506079bc135638a14e23e25be909131928db2", size = 19214172, upload-time = "2020-01-20T14:27:23.5Z" }
+
+[[package]]
 name = "jinja2"
 version = "3.1.6"
 source = { registry = "https://pypi.org/simple" }
@@ -1864,6 +1870,8 @@ source = { virtual = "." }
 dependencies = [
     { name = "accelerate" },
     { name = "datasets" },
+    { name = "huggingface-hub" },
+    { name = "jieba" },
     { name = "jiwer" },
     { name = "openai-whisper" },
     { name = "pronouncing" },
@@ -1881,6 +1889,8 @@ dependencies = [
 requires-dist = [
     { name = "accelerate", specifier = ">=1.2.0" },
     { name = "datasets", specifier = ">=5.0.0" },
+    { name = "huggingface-hub", specifier = ">=1.21.0" },
+    { name = "jieba", specifier = ">=0.42.1" },
     { name = "jiwer", specifier = ">=4.0.0" },
     { name = "openai-whisper", specifier = ">=20250625" },
     { name = "pronouncing", specifier = ">=0.3.0" },

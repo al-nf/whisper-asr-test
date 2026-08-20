@@ -325,6 +325,12 @@ def evaluate_locale(
             "format_noncompliant": format_flags[i],
             "sample_wer_raw": metric_or_nan(wer, [refs_clean[i]], [raw_clean[i]]),
             "sample_wer_llm": metric_or_nan(wer, [refs_clean[i]], [llm_clean[i]]),
+            # WER degenerates for zh: normalize_text produces a whitespace-free
+            # string, so jiwer.wer treats the whole sentence as one token
+            # (near-binary "exact match or not"). CER is the metric that
+            # actually carries signal there.
+            "sample_cer_raw": metric_or_nan(cer, [refs_clean[i]], [raw_clean[i]]),
+            "sample_cer_llm": metric_or_nan(cer, [refs_clean[i]], [llm_clean[i]]),
         }
         for i in range(len(refs))
     ]
