@@ -121,24 +121,40 @@ def _run_batch(
     max_new_tokens: int,
     language: str,
     task: str,
+    num_beam_groups: int = 1,
+    diversity_penalty: float = 0.0,
 ) -> List[dict]:
     """Runs beam search on a single (small) chunk of the dataset. Raises on
-    failure - callers handle OOM-style retries."""
+    failure - callers handle OOM-style retries.
+
+    `num_beam_groups > 1` switches to HF's diverse beam search (groups beams
+    and penalizes within-step similarity across groups). Plain beam search on
+    a narrowly fine-tuned, highly confident model (like an AISHELL-only
+    Whisper checkpoint on short, clean, in-domain read speech) tends to
+    produce near-duplicate beams that collapse to a single unique candidate
+    after dedup - leaving nothing for any n-gram LM to rescore, independent of
+    order or alpha. Diverse beam search is the standard fix: it directly
+    forces beams apart instead of hoping plain beam search happens to
+    diversify on its own."""
     audio_arrays = [a["array"] for a in sub_dataset["audio"]]
     inputs = processor(audio_arrays, sampling_rate=16000, return_tensors="pt")
     input_features = inputs.input_features.to(device=device, dtype=model.dtype)
 
+    generate_kwargs = dict(
+        num_beams=num_beams,
+        num_return_sequences=num_beams,
+        output_scores=True,
+        return_dict_in_generate=True,
+        max_new_tokens=max_new_tokens,
+        language=language,
+        task=task,
+    )
+    if num_beam_groups > 1:
+        generate_kwargs["num_beam_groups"] = num_beam_groups
+        generate_kwargs["diversity_penalty"] = diversity_penalty
+
     with torch.no_grad():
-        output = model.generate(
-            input_features,
-            num_beams=num_beams,
-            num_return_sequences=num_beams,
-            output_scores=True,
-            return_dict_in_generate=True,
-            max_new_tokens=max_new_tokens,
-            language=language,
-            task=task,
-        )
+        output = model.generate(input_features, **generate_kwargs)
 
     texts = processor.batch_decode(output.sequences, skip_special_tokens=True)
     scores = output.sequences_scores.tolist()
@@ -190,13 +206,18 @@ def _run_batch_with_retry(
     max_new_tokens: int,
     language: str,
     task: str,
+    num_beam_groups: int = 1,
+    diversity_penalty: float = 0.0,
 ) -> List[dict]:
     """Runs `_run_batch`, and on a CUDA OOM / Jetson NVML-allocator error
     (see module docstring), frees memory and retries with the batch split in
     half - down to single utterances. A single utterance that still fails
     is recorded with an empty hypothesis rather than aborting the whole run."""
     try:
-        return _run_batch(model, processor, device, sub_dataset, num_beams, max_new_tokens, language, task)
+        return _run_batch(
+            model, processor, device, sub_dataset, num_beams, max_new_tokens, language, task,
+            num_beam_groups, diversity_penalty,
+        )
     except RuntimeError as e:
         if not _is_recoverable_cuda_error(e):
             raise
@@ -219,8 +240,10 @@ def _run_batch_with_retry(
         left = sub_dataset.select(range(0, mid))
         right = sub_dataset.select(range(mid, n))
         return _run_batch_with_retry(
-            model, processor, device, left, num_beams, max_new_tokens, language, task
-        ) + _run_batch_with_retry(model, processor, device, right, num_beams, max_new_tokens, language, task)
+            model, processor, device, left, num_beams, max_new_tokens, language, task, num_beam_groups, diversity_penalty
+        ) + _run_batch_with_retry(
+            model, processor, device, right, num_beams, max_new_tokens, language, task, num_beam_groups, diversity_penalty
+        )
 
 
 def generate_nbest(
@@ -234,6 +257,8 @@ def generate_nbest(
     language: str,
     task: str,
     checkpoint_path: Optional[str] = None,
+    num_beam_groups: int = 1,
+    diversity_penalty: float = 0.0,
 ) -> List[dict]:
     """Runs Whisper beam search once per utterance, keeping the top `num_beams`
     candidates and their length-normalized acoustic log-probs. This is the
@@ -260,7 +285,11 @@ def generate_nbest(
             start = b * batch_size
             end = min(start + batch_size, len(subset))
             sub = subset.select(range(start, end))
-            for item in _run_batch_with_retry(model, processor, device, sub, num_beams, max_new_tokens, language, task):
+            batch_results = _run_batch_with_retry(
+                model, processor, device, sub, num_beams, max_new_tokens, language, task,
+                num_beam_groups, diversity_penalty,
+            )
+            for item in batch_results:
                 results_by_id[item["utt_id"]] = item
             if checkpoint_path:
                 ordered_so_far = [results_by_id[name] for name in full_names if name in results_by_id]
@@ -387,6 +416,21 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--schemes", nargs="+", choices=list(TOKENIZERS), default=DEFAULT_SCHEMES)
     parser.add_argument("--alpha-grid", nargs="+", type=float, default=DEFAULT_ALPHA_GRID)
     parser.add_argument("--num-beams", type=int, default=5, help="Beam width == N-best size.")
+    parser.add_argument(
+        "--num-beam-groups",
+        type=int,
+        default=1,
+        help="Use HF diverse beam search with this many groups (must divide --num-beams evenly, and be >1 to "
+        "take effect). Fixes beam collapse on confident, narrow-domain models where plain beam search produces "
+        "near-duplicate candidates that dedup down to 1 per utterance, leaving nothing to rescore. Try e.g. 5 "
+        "(with --num-beams 5) if diagnose_nbest.py shows most utterances have only 1 unique candidate.",
+    )
+    parser.add_argument(
+        "--diversity-penalty",
+        type=float,
+        default=0.5,
+        help="Diverse beam search penalty (only used if --num-beam-groups > 1).",
+    )
     parser.add_argument("--max-new-tokens", type=int, default=48)
     parser.add_argument("--batch-size", type=int, default=4)
     parser.add_argument("--max-samples", type=int, default=None, help="Subsample the test set (for quick iteration).")
@@ -435,7 +479,10 @@ def main() -> None:
     if os.path.exists(run_config_path) and os.path.exists(os.path.join(run_dir, "nbest.json")):
         with open(run_config_path, "r", encoding="utf-8") as f:
             prev_config = json.load(f)
-        generation_keys = ["asr_model", "num_beams", "max_new_tokens", "language", "task", "resolved_dtype"]
+        generation_keys = [
+            "asr_model", "num_beams", "num_beam_groups", "diversity_penalty",
+            "max_new_tokens", "language", "task", "resolved_dtype",
+        ]
         mismatches = [k for k in generation_keys if prev_config.get(k) != run_config.get(k)]
         if mismatches:
             print(
@@ -480,6 +527,8 @@ def main() -> None:
             language=args.language,
             task=args.task,
             checkpoint_path=checkpoint_path,
+            num_beam_groups=args.num_beam_groups,
+            diversity_penalty=args.diversity_penalty,
         )
         save_json(checkpoint_path, nbest)
 

@@ -203,6 +203,42 @@ ways:
 
 If crashes persist, lower `--batch-size` and/or `--num-beams` further.
 
+#### Every condition shows `alpha*=0.00` and CER identical to baseline
+
+This means **no alpha in the grid ever changed which candidate was picked,
+for any of the 8 (scheme, order) conditions** - i.e. a dead tie, not "the LM
+made things worse." That specific pattern is almost never a genuine "n-gram
+fusion doesn't help" result; it's what you get when the N-best candidate
+lists have collapsed to one unique hypothesis per utterance. Plain beam
+search on a narrowly fine-tuned, highly confident model (AISHELL-1 is short,
+clean, in-domain read speech) can produce beams that are near-duplicates and
+dedup down to a single candidate - leaving nothing for any LM to rescore,
+independent of order or alpha.
+
+Check this directly against the cached `nbest.json` (no KenLM/jieba needed):
+
+```
+uv run diagnose_nbest.py ./logs/aishell_ngram_fusion/nbest.json
+```
+
+It reports the unique-candidate-count distribution, the acoustic score gap
+between rank-0/rank-1 candidates, and an **oracle CER** (best-case CER if you
+always picked the N-best candidate closest to the reference) vs. the
+baseline CER - the gap between them is the ceiling on what any rescoring
+method could achieve with that N-best list. If oracle RER is near zero, or
+most utterances have exactly 1 unique candidate, the fix isn't rescoring at
+all - it's generating a more diverse N-best in the first place. Use diverse
+beam search for that:
+
+```
+uv run eval_aishell_ngram_fusion.py --num-beams 5 --num-beam-groups 5 --diversity-penalty 0.5
+```
+
+`--num-beam-groups` (must divide `--num-beams` evenly) switches HF's
+`generate()` to grouped/diverse beam search, which directly penalizes
+similarity between groups' beams at every step instead of hoping plain beam
+search happens to diversify on its own.
+
 ### 5. Analyze: confirm or refute the hypothesis
 
 Computes RER per order/scheme, a paired bootstrap CI and P(no improvement)
