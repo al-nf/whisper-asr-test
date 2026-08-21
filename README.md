@@ -225,19 +225,44 @@ It reports the unique-candidate-count distribution, the acoustic score gap
 between rank-0/rank-1 candidates, and an **oracle CER** (best-case CER if you
 always picked the N-best candidate closest to the reference) vs. the
 baseline CER - the gap between them is the ceiling on what any rescoring
-method could achieve with that N-best list. If oracle RER is near zero, or
-most utterances have exactly 1 unique candidate, the fix isn't rescoring at
-all - it's generating a more diverse N-best in the first place. Use diverse
-beam search for that:
+method could achieve with that N-best list.
+
+On `junsor/whisper-small-aishell` over the full AISHELL-1 test set, this
+diagnostic came back as total collapse: **100% of the 7176 utterances had
+exactly 1 unique candidate**, and oracle CER was bit-for-bit equal to
+baseline CER (RER=+0.0%). This isn't a WER-vs-CER artifact - `diagnose_nbest.py`
+never computes WER at all, and `eval_aishell_ngram_fusion.py`'s alpha
+selection (`evaluate_condition`) already picks `best_alpha` by minimizing
+`cer(refs, hyps)`, never `wer`. It also isn't an LM-scoring bug - `avg_logprob`'s
+unit conversion (log10 to natural log, per-token normalization) is correct.
+It means deterministic beam search's top-k expansion is re-deriving the exact
+same argmax path every time: ASR posteriors on clean, in-domain, single-domain
+fine-tuned audio are typically far more peaked than open-ended text
+generation, so there's nothing left in the N-best list for *any* LM, order,
+or alpha to rescore between.
+
+Two ways to force genuine diversity when generating N-best (mutually
+exclusive - HF gives diverse beam search priority if both are set):
 
 ```
+# Diverse beam search: groups beams, penalizes cross-group similarity at every step.
+# Deterministic; guarantees distinct candidates, but the diversity is an artificial
+# penalty rather than the model's own uncertainty.
 uv run eval_aishell_ngram_fusion.py --num-beams 5 --num-beam-groups 5 --diversity-penalty 0.5
+
+# Beam-search multinomial sampling ("beam-sample"): keeps beam-search's score
+# bookkeeping, but samples each step's expansion instead of always taking the
+# global top-k. Even a 99.99%-confident model will occasionally sample a
+# non-argmax token where it isn't fully certain - more faithful to "the
+# model's actual alternate hypotheses" than an artificial diversity penalty,
+# at the cost of some run-to-run sampling noise.
+uv run eval_aishell_ngram_fusion.py --num-beams 5 --do-sample --temperature 1.0
 ```
 
-`--num-beam-groups` (must divide `--num-beams` evenly) switches HF's
-`generate()` to grouped/diverse beam search, which directly penalizes
-similarity between groups' beams at every step instead of hoping plain beam
-search happens to diversify on its own.
+Re-run `diagnose_nbest.py` against the resulting `nbest.json` after either
+one - if the unique-candidate-count distribution is still collapsed to 1,
+push `--diversity-penalty` / `--temperature` higher before concluding
+anything about the n-gram order hypothesis itself.
 
 ### 5. Analyze: confirm or refute the hypothesis
 

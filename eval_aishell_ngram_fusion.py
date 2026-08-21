@@ -121,21 +121,40 @@ def _run_batch(
     max_new_tokens: int,
     language: str,
     task: str,
-    num_beam_groups: int = 1,
-    diversity_penalty: float = 0.0,
+    diversity_opts: Optional[dict] = None,
 ) -> List[dict]:
     """Runs beam search on a single (small) chunk of the dataset. Raises on
     failure - callers handle OOM-style retries.
 
-    `num_beam_groups > 1` switches to HF's diverse beam search (groups beams
-    and penalizes within-step similarity across groups). Plain beam search on
-    a narrowly fine-tuned, highly confident model (like an AISHELL-only
-    Whisper checkpoint on short, clean, in-domain read speech) tends to
-    produce near-duplicate beams that collapse to a single unique candidate
-    after dedup - leaving nothing for any n-gram LM to rescore, independent of
-    order or alpha. Diverse beam search is the standard fix: it directly
-    forces beams apart instead of hoping plain beam search happens to
-    diversify on its own."""
+    Plain (deterministic) beam search on a narrowly fine-tuned, highly
+    confident model - like an AISHELL-only Whisper checkpoint on short,
+    clean, in-domain read speech - can converge every beam to the identical
+    top-1 sequence: ASR posteriors are usually far more peaked than
+    open-ended text generation, so beam search's top-k expansion just
+    re-derives the same argmax path k times. That leaves nothing for any
+    n-gram LM to rescore, independent of order or alpha. Two ways to force
+    real diversity:
+
+    - `num_beam_groups > 1`: HF's diverse beam search - groups beams and
+      penalizes within-step similarity across groups. Deterministic;
+      guarantees distinct candidates, but the "diversity" is an artificial
+      penalty rather than the model's own uncertainty.
+    - `do_sample=True` (with `num_beams > 1`, HF's "beam-search multinomial
+      sampling" / beam-sample mode): keeps beam-search's score bookkeeping,
+      but expands each step by sampling instead of deterministically taking
+      the global top-k continuations. Even a 99.99%-confident model will
+      occasionally sample a non-argmax token at the few positions where it
+      isn't fully certain, so beams stop being guaranteed-identical. More
+      faithful to "the model's actual alternate hypotheses" than diverse
+      beam search, at the cost of some run-to-run noise (seeded via
+      `torch.manual_seed` by the caller if reproducibility matters).
+
+    `num_beam_groups > 1` and `do_sample=True` are mutually exclusive in HF's
+    generate() (group beam search always wins if both are set) - pick one.
+
+    `diversity_opts` (all optional): {num_beam_groups, diversity_penalty,
+    do_sample, temperature, top_k, top_p}."""
+    opts = diversity_opts or {}
     audio_arrays = [a["array"] for a in sub_dataset["audio"]]
     inputs = processor(audio_arrays, sampling_rate=16000, return_tensors="pt")
     input_features = inputs.input_features.to(device=device, dtype=model.dtype)
@@ -149,9 +168,19 @@ def _run_batch(
         language=language,
         task=task,
     )
+    num_beam_groups = opts.get("num_beam_groups", 1)
     if num_beam_groups > 1:
         generate_kwargs["num_beam_groups"] = num_beam_groups
-        generate_kwargs["diversity_penalty"] = diversity_penalty
+        generate_kwargs["diversity_penalty"] = opts.get("diversity_penalty", 0.0)
+    elif opts.get("do_sample"):
+        generate_kwargs["do_sample"] = True
+        generate_kwargs["temperature"] = opts.get("temperature", 1.0)
+        top_k = opts.get("top_k", 0)
+        top_p = opts.get("top_p", 1.0)
+        if top_k > 0:
+            generate_kwargs["top_k"] = top_k
+        if top_p < 1.0:
+            generate_kwargs["top_p"] = top_p
 
     with torch.no_grad():
         output = model.generate(input_features, **generate_kwargs)
@@ -206,18 +235,14 @@ def _run_batch_with_retry(
     max_new_tokens: int,
     language: str,
     task: str,
-    num_beam_groups: int = 1,
-    diversity_penalty: float = 0.0,
+    diversity_opts: Optional[dict] = None,
 ) -> List[dict]:
     """Runs `_run_batch`, and on a CUDA OOM / Jetson NVML-allocator error
     (see module docstring), frees memory and retries with the batch split in
     half - down to single utterances. A single utterance that still fails
     is recorded with an empty hypothesis rather than aborting the whole run."""
     try:
-        return _run_batch(
-            model, processor, device, sub_dataset, num_beams, max_new_tokens, language, task,
-            num_beam_groups, diversity_penalty,
-        )
+        return _run_batch(model, processor, device, sub_dataset, num_beams, max_new_tokens, language, task, diversity_opts)
     except RuntimeError as e:
         if not _is_recoverable_cuda_error(e):
             raise
@@ -240,9 +265,9 @@ def _run_batch_with_retry(
         left = sub_dataset.select(range(0, mid))
         right = sub_dataset.select(range(mid, n))
         return _run_batch_with_retry(
-            model, processor, device, left, num_beams, max_new_tokens, language, task, num_beam_groups, diversity_penalty
+            model, processor, device, left, num_beams, max_new_tokens, language, task, diversity_opts
         ) + _run_batch_with_retry(
-            model, processor, device, right, num_beams, max_new_tokens, language, task, num_beam_groups, diversity_penalty
+            model, processor, device, right, num_beams, max_new_tokens, language, task, diversity_opts
         )
 
 
@@ -257,8 +282,7 @@ def generate_nbest(
     language: str,
     task: str,
     checkpoint_path: Optional[str] = None,
-    num_beam_groups: int = 1,
-    diversity_penalty: float = 0.0,
+    diversity_opts: Optional[dict] = None,
 ) -> List[dict]:
     """Runs Whisper beam search once per utterance, keeping the top `num_beams`
     candidates and their length-normalized acoustic log-probs. This is the
@@ -286,8 +310,7 @@ def generate_nbest(
             end = min(start + batch_size, len(subset))
             sub = subset.select(range(start, end))
             batch_results = _run_batch_with_retry(
-                model, processor, device, sub, num_beams, max_new_tokens, language, task,
-                num_beam_groups, diversity_penalty,
+                model, processor, device, sub, num_beams, max_new_tokens, language, task, diversity_opts
             )
             for item in batch_results:
                 results_by_id[item["utt_id"]] = item
@@ -431,6 +454,18 @@ def parse_args() -> argparse.Namespace:
         default=0.5,
         help="Diverse beam search penalty (only used if --num-beam-groups > 1).",
     )
+    parser.add_argument(
+        "--do-sample",
+        action="store_true",
+        help="Use HF's 'beam-search multinomial sampling' (do_sample=True with --num-beams > 1) instead of "
+        "plain deterministic beam search: keeps beam-search score bookkeeping but samples each step's "
+        "expansion, so beams aren't guaranteed-identical even when the model is extremely confident. The "
+        "more faithful alternative to --num-beam-groups for fixing beam collapse (see diagnose_nbest.py). "
+        "Ignored if --num-beam-groups > 1 (HF gives diverse beam search priority over sampling).",
+    )
+    parser.add_argument("--temperature", type=float, default=1.0, help="Sampling temperature (only if --do-sample).")
+    parser.add_argument("--top-k", type=int, default=0, help="Top-k filtering for sampling (0 = disabled).")
+    parser.add_argument("--top-p", type=float, default=1.0, help="Nucleus filtering for sampling (1.0 = disabled).")
     parser.add_argument("--max-new-tokens", type=int, default=48)
     parser.add_argument("--batch-size", type=int, default=4)
     parser.add_argument("--max-samples", type=int, default=None, help="Subsample the test set (for quick iteration).")
@@ -481,6 +516,7 @@ def main() -> None:
             prev_config = json.load(f)
         generation_keys = [
             "asr_model", "num_beams", "num_beam_groups", "diversity_penalty",
+            "do_sample", "temperature", "top_k", "top_p",
             "max_new_tokens", "language", "task", "resolved_dtype",
         ]
         mismatches = [k for k in generation_keys if prev_config.get(k) != run_config.get(k)]
@@ -516,6 +552,14 @@ def main() -> None:
         model.eval()
 
         checkpoint_path = os.path.join(run_dir, "nbest.json")
+        diversity_opts = {
+            "num_beam_groups": args.num_beam_groups,
+            "diversity_penalty": args.diversity_penalty,
+            "do_sample": args.do_sample,
+            "temperature": args.temperature,
+            "top_k": args.top_k,
+            "top_p": args.top_p,
+        }
         nbest = generate_nbest(
             dataset,
             model,
@@ -527,8 +571,7 @@ def main() -> None:
             language=args.language,
             task=args.task,
             checkpoint_path=checkpoint_path,
-            num_beam_groups=args.num_beam_groups,
-            diversity_penalty=args.diversity_penalty,
+            diversity_opts=diversity_opts,
         )
         save_json(checkpoint_path, nbest)
 
