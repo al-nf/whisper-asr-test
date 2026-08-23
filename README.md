@@ -250,14 +250,25 @@ exclusive - HF gives diverse beam search priority if both are set):
 # penalty rather than the model's own uncertainty.
 uv run eval_aishell_ngram_fusion.py --num-beams 5 --num-beam-groups 5 --diversity-penalty 0.5
 
-# Beam-search multinomial sampling ("beam-sample"): keeps beam-search's score
-# bookkeeping, but samples each step's expansion instead of always taking the
-# global top-k. Even a 99.99%-confident model will occasionally sample a
-# non-argmax token where it isn't fully certain - more faithful to "the
-# model's actual alternate hypotheses" than an artificial diversity penalty,
-# at the cost of some run-to-run sampling noise.
+# Independent multinomial sampling: --num-beams candidates sampled independently
+# instead of one deterministic beam search. Note this is *not* beam search at
+# all under the hood - see below - but it's the other diversity knob available.
 uv run eval_aishell_ngram_fusion.py --num-beams 5 --do-sample --temperature 1.0
 ```
+
+`--do-sample` is *not* HF's generic "beam-search multinomial sampling" (which
+would keep beam-search bookkeeping while sampling each expansion step).
+`WhisperForConditionalGeneration.generate()`'s temperature-fallback logic
+(`generate_with_fallback` in `transformers.models.whisper.generation_whisper`,
+its mechanism for retrying low-confidence long-form segments at higher
+temperatures) unconditionally forces `num_beams=1` whenever `do_sample=True`,
+regardless of what's passed in - Whisper models cannot do beam-search +
+sampling together. So `--do-sample` actually runs as `--num-beams`
+*independent ancestral samples*, not beam search; `acoustic_avg_logprob` is
+reconstructed from `compute_transition_scores` since sampled output has no
+`sequences_scores` field. This is still a legitimate, different diversity
+mechanism (fully stochastic vs. diverse beam search's explicit penalty) - just
+don't expect beam-search-quality candidates from it.
 
 Re-run `diagnose_nbest.py` against the resulting `nbest.json` after either
 one - if the unique-candidate-count distribution is still collapsed to 1,

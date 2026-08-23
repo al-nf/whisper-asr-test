@@ -112,6 +112,34 @@ def tune_eval_split(n: int, tune_frac: float, seed: int) -> "tuple[List[int], Li
     return indices[:n_tune], indices[n_tune:]
 
 
+def _transition_avg_logprobs(model, sequences: "torch.Tensor", scores: tuple) -> List[float]:
+    """Per-sequence average natural-log token probability, computed directly
+    from `compute_transition_scores` instead of `output.sequences_scores`.
+
+    Needed because `WhisperForConditionalGeneration.generate()`'s internal
+    "temperature fallback" logic (`generate_with_fallback` in
+    `transformers.models.whisper.generation_whisper`) unconditionally forces
+    `num_beams=1` whenever `do_sample=True` - so a `do_sample=True` call never
+    actually uses beam search, and the returned `GenerateEncoderDecoderOutput`
+    has no `sequences_scores` attribute at all (that field only exists on
+    `GenerateBeamEncoderDecoderOutput`). This reconstructs an equivalent
+    average log-prob directly from `output.scores` for that case."""
+    transition_scores = model.compute_transition_scores(sequences, scores, normalize_logits=True)
+    n_steps = transition_scores.shape[1]
+    generated = sequences[:, sequences.shape[1] - n_steps :]
+
+    eos_token_id = model.generation_config.eos_token_id
+    eos_ids = eos_token_id if isinstance(eos_token_id, (list, tuple)) else [eos_token_id]
+    is_eos = torch.isin(generated, torch.tensor(eos_ids, device=generated.device))
+
+    avg_logprobs = []
+    for row_scores, row_is_eos in zip(transition_scores, is_eos):
+        eos_pos = torch.nonzero(row_is_eos, as_tuple=True)[0]
+        length = max(int(eos_pos[0].item()) + 1 if eos_pos.numel() > 0 else row_scores.shape[0], 1)
+        avg_logprobs.append((row_scores[:length].sum() / length).item())
+    return avg_logprobs
+
+
 def _run_batch(
     model,
     processor,
@@ -123,8 +151,8 @@ def _run_batch(
     task: str,
     diversity_opts: Optional[dict] = None,
 ) -> List[dict]:
-    """Runs beam search on a single (small) chunk of the dataset. Raises on
-    failure - callers handle OOM-style retries.
+    """Runs beam search (or sampling) on a single (small) chunk of the
+    dataset. Raises on failure - callers handle OOM-style retries.
 
     Plain (deterministic) beam search on a narrowly fine-tuned, highly
     confident model - like an AISHELL-only Whisper checkpoint on short,
@@ -139,18 +167,17 @@ def _run_batch(
       penalizes within-step similarity across groups. Deterministic;
       guarantees distinct candidates, but the "diversity" is an artificial
       penalty rather than the model's own uncertainty.
-    - `do_sample=True` (with `num_beams > 1`, HF's "beam-search multinomial
-      sampling" / beam-sample mode): keeps beam-search's score bookkeeping,
-      but expands each step by sampling instead of deterministically taking
-      the global top-k continuations. Even a 99.99%-confident model will
-      occasionally sample a non-argmax token at the few positions where it
-      isn't fully certain, so beams stop being guaranteed-identical. More
-      faithful to "the model's actual alternate hypotheses" than diverse
-      beam search, at the cost of some run-to-run noise (seeded via
-      `torch.manual_seed` by the caller if reproducibility matters).
+    - `do_sample=True`: independent multinomial-sampled candidates. Note this
+      is *not* HF's generic "beam-search multinomial sampling" (do_sample +
+      num_beams>1) - `WhisperForConditionalGeneration.generate()`'s
+      temperature-fallback logic hardcodes `num_beams=1` whenever
+      `do_sample=True`, so this always runs as `num_beams` independent
+      ancestral samples (`num_return_sequences=num_beams`), not beam search.
+      `acoustic_avg_logprob` is reconstructed via `_transition_avg_logprobs`
+      since `sequences_scores` isn't populated for non-beam generation.
 
-    `num_beam_groups > 1` and `do_sample=True` are mutually exclusive in HF's
-    generate() (group beam search always wins if both are set) - pick one.
+    `num_beam_groups > 1` and `do_sample=True` are mutually exclusive here -
+    if both are set, diverse beam search wins.
 
     `diversity_opts` (all optional): {num_beam_groups, diversity_penalty,
     do_sample, temperature, top_k, top_p}."""
@@ -186,7 +213,11 @@ def _run_batch(
         output = model.generate(input_features, **generate_kwargs)
 
     texts = processor.batch_decode(output.sequences, skip_special_tokens=True)
-    scores = output.sequences_scores.tolist()
+    sequences_scores = getattr(output, "sequences_scores", None)
+    if sequences_scores is not None:
+        scores = sequences_scores.tolist()
+    else:
+        scores = _transition_avg_logprobs(model, output.sequences, output.scores)
 
     out = []
     for i in range(len(audio_arrays)):
