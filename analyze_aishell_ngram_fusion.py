@@ -1,8 +1,13 @@
 """Verdict tool for eval_aishell_ngram_fusion.py: turns the raw per-condition
-CER/WER numbers into an explicit statement about the hypothesis under test -
+CER numbers into an explicit statement about the hypothesis under test -
 
     "Chinese ASR benefits most from a low-order (bi/tri-gram) n-gram LM,
     unlike the 5-gram order typically used for space-delimited languages."
+
+(WER is deliberately not used anywhere in this analysis: Mandarin has no
+native word boundaries, so any "word" only exists relative to an arbitrary
+segmentation tool's choices, unlike CER which measures something intrinsic
+to the text. `eval_aishell_ngram_fusion.py` doesn't report it either.)
 
 For each tokenization scheme, this:
   1. Prints a RER-vs-order table (the raw evidence).
@@ -18,9 +23,9 @@ For each tokenization scheme, this:
      or the LM doesn't help at all (RER not significantly above zero).
 
 Performance note: per-utterance edit-distance/length is computed with jiwer
-exactly once per (row list, metric) via `prepare_rows` - the bootstrap loop
-itself is pure integer arithmetic over precomputed arrays, not repeated
-string alignment, so thousands of resamples stay fast even on the full
+exactly once per row list via `prepare_rows` - the bootstrap loop itself is
+pure integer arithmetic over precomputed arrays, not repeated string
+alignment, so thousands of resamples stay fast even on the full
 ~5-7k-utterance eval split.
 
 Usage:
@@ -39,8 +44,6 @@ import jiwer
 from rich.console import Console
 from rich.table import Table
 
-from ngram_lm import TOKENIZERS
-
 CI_LOW, CI_HIGH = 0.025, 0.975
 
 
@@ -52,38 +55,27 @@ def load_results(run_dir: str) -> dict:
 
 @dataclass
 class Prepared:
-    """Per-utterance edit-distance numerator/denominator for CER and
-    jieba-based WER, precomputed once per row list so bootstrap resampling is
-    pure arithmetic."""
+    """Per-utterance CER edit-distance numerator/denominator, precomputed
+    once per row list so bootstrap resampling is pure arithmetic."""
 
     cer_edits: List[int]
     cer_lens: List[int]
-    wer_edits: List[int]
-    wer_lens: List[int]
 
 
 def prepare_rows(rows: List[dict]) -> Prepared:
-    tokenize = TOKENIZERS["word"]
-    cer_edits, cer_lens, wer_edits, wer_lens = [], [], [], []
+    cer_edits, cer_lens = [], []
     for row in rows:
-        ref, hyp = row["ref"], row["hyp"]
-        c = jiwer.process_characters([ref], [hyp])
+        c = jiwer.process_characters([row["ref"]], [row["hyp"]])
         cer_edits.append(c.substitutions + c.deletions + c.insertions)
         cer_lens.append(c.hits + c.substitutions + c.deletions)
-
-        w = jiwer.process_words([" ".join(tokenize(ref))], [" ".join(tokenize(hyp))])
-        wer_edits.append(w.substitutions + w.deletions + w.insertions)
-        wer_lens.append(w.hits + w.substitutions + w.deletions)
-    return Prepared(cer_edits, cer_lens, wer_edits, wer_lens)
+    return Prepared(cer_edits, cer_lens)
 
 
-def rate_from_prepared(prepared: Prepared, sample_idx: List[int], metric: str) -> float:
-    edits = prepared.cer_edits if metric == "cer" else prepared.wer_edits
-    lens = prepared.cer_lens if metric == "cer" else prepared.wer_lens
-    total_len = sum(lens[i] for i in sample_idx)
+def rate_from_prepared(prepared: Prepared, sample_idx: List[int]) -> float:
+    total_len = sum(prepared.cer_lens[i] for i in sample_idx)
     if total_len == 0:
         return 0.0
-    return sum(edits[i] for i in sample_idx) / total_len
+    return sum(prepared.cer_edits[i] for i in sample_idx) / total_len
 
 
 def percentile(values: List[float], p: float) -> float:
@@ -93,7 +85,7 @@ def percentile(values: List[float], p: float) -> float:
 
 
 def bootstrap_rer(
-    baseline_prepared: Prepared, condition_prepared: Prepared, n_boot: int, seed: int, metric: str
+    baseline_prepared: Prepared, condition_prepared: Prepared, n_boot: int, seed: int
 ) -> "tuple[float, float, float, float]":
     """Paired bootstrap over utterance indices (shared between baseline and
     condition rows, which are aligned 1:1 by construction in
@@ -105,8 +97,8 @@ def bootstrap_rer(
     rers = []
     for _ in range(n_boot):
         sample_idx = [rng.randrange(n) for _ in range(n)]
-        base_rate = rate_from_prepared(baseline_prepared, sample_idx, metric)
-        cond_rate = rate_from_prepared(condition_prepared, sample_idx, metric)
+        base_rate = rate_from_prepared(baseline_prepared, sample_idx)
+        cond_rate = rate_from_prepared(condition_prepared, sample_idx)
         if base_rate == 0:
             continue
         rers.append((base_rate - cond_rate) / base_rate)
@@ -117,7 +109,7 @@ def bootstrap_rer(
 
 
 def bootstrap_rate_gap(
-    prepared_a: Prepared, prepared_b: Prepared, n_boot: int, seed: int, metric: str
+    prepared_a: Prepared, prepared_b: Prepared, n_boot: int, seed: int
 ) -> "tuple[float, float, float]":
     """CI on rate(a) - rate(b) over paired bootstrap resamples. Used to check
     whether the empirically-best order is *significantly* better than a
@@ -127,9 +119,7 @@ def bootstrap_rate_gap(
     gaps = []
     for _ in range(n_boot):
         sample_idx = [rng.randrange(n) for _ in range(n)]
-        gaps.append(
-            rate_from_prepared(prepared_a, sample_idx, metric) - rate_from_prepared(prepared_b, sample_idx, metric)
-        )
+        gaps.append(rate_from_prepared(prepared_a, sample_idx) - rate_from_prepared(prepared_b, sample_idx))
     return statistics.mean(gaps), percentile(gaps, CI_LOW), percentile(gaps, CI_HIGH)
 
 
@@ -138,7 +128,6 @@ def render_rer_table(
     baseline: dict,
     conditions: List[dict],
     cer_stats: "dict[int, tuple]",
-    wer_stats: "dict[int, tuple]",
 ) -> Table:
     table = Table(title=f"RER vs. n-gram order - scheme={scheme}")
     table.add_column("Order", justify="right")
@@ -146,20 +135,15 @@ def render_rer_table(
     table.add_column("RER (CER)", justify="right")
     table.add_column("95% CI", justify="right")
     table.add_column("P(no improvement)", justify="right")
-    table.add_column("WER", justify="right")
-    table.add_column("RER (WER)", justify="right")
-    table.add_row("baseline", f"{baseline['cer']:.4f}", "-", "-", "-", f"{baseline['wer']:.4f}", "-")
+    table.add_row("baseline", f"{baseline['cer']:.4f}", "-", "-", "-")
     for c in conditions:
         mean_rer, lo, hi, p_no = cer_stats[c["order"]]
-        wer_mean_rer, _, _, _ = wer_stats[c["order"]]
         table.add_row(
             str(c["order"]),
             f"{c['eval_cer']:.4f}",
             f"{mean_rer:+.1%}",
             f"[{lo:+.1%}, {hi:+.1%}]",
             f"{p_no:.1%}",
-            f"{c['eval_wer']:.4f}",
-            f"{wer_mean_rer:+.1%}",
         )
     return table
 
@@ -169,14 +153,10 @@ def verdict_for_scheme(scheme: str, baseline: dict, conditions: List[dict], n_bo
     condition_prepared = {c["order"]: prepare_rows(c["rows"]) for c in conditions}
 
     cer_stats = {
-        order: bootstrap_rer(baseline_prepared, prepared, n_boot, seed + order, metric="cer")
+        order: bootstrap_rer(baseline_prepared, prepared, n_boot, seed + order)
         for order, prepared in condition_prepared.items()
     }
-    wer_stats = {
-        order: bootstrap_rer(baseline_prepared, prepared, n_boot, seed + 500 + order, metric="wer")
-        for order, prepared in condition_prepared.items()
-    }
-    console.print(render_rer_table(scheme, baseline, conditions, cer_stats, wer_stats))
+    console.print(render_rer_table(scheme, baseline, conditions, cer_stats))
 
     best = min(conditions, key=lambda c: c["eval_cer"])
     best_mean_rer, best_lo, best_hi, best_p_no = cer_stats[best["order"]]
@@ -195,7 +175,7 @@ def verdict_for_scheme(scheme: str, baseline: dict, conditions: List[dict], n_bo
         if c["order"] == best["order"]:
             continue
         _, lo, hi = bootstrap_rate_gap(
-            condition_prepared[c["order"]], condition_prepared[best["order"]], n_boot, seed + 1000 + c["order"], metric="cer"
+            condition_prepared[c["order"]], condition_prepared[best["order"]], n_boot, seed + 1000 + c["order"]
         )
         if lo <= 0 <= hi:
             tied_orders.append(c["order"])

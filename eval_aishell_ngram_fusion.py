@@ -28,9 +28,10 @@ sanity check.
 
 RER (relative error-rate reduction) = (baseline_error - condition_error) /
 baseline_error, computed against the *same* eval subset's baseline. Alpha is
-always tuned to minimize CER (the standard, segmentation-tool-independent
-metric for Chinese); jieba-based WER is also reported per condition using
-that same tuned alpha, as a secondary diagnostic.
+always tuned to minimize CER, the standard metric for Chinese (WER isn't
+reported: Mandarin has no native word boundaries, so any "word" only exists
+relative to an arbitrary segmentation tool's choices - unlike CER, it
+wouldn't be measuring something intrinsic to the text).
 
 Usage:
     uv run eval_aishell_ngram_fusion.py
@@ -64,7 +65,7 @@ from typing import List, Optional
 
 import torch
 from datasets import load_dataset
-from jiwer import cer, wer
+from jiwer import cer
 from rich.console import Console
 from rich.table import Table
 from tqdm import tqdm
@@ -407,8 +408,6 @@ def evaluate_condition(
 
     refs = [r["ref"] for r in rows]
     hyps = [r["hyp"] for r in rows]
-    word_refs = [" ".join(TOKENIZERS["word"](r)) for r in refs]
-    word_hyps = [" ".join(TOKENIZERS["word"](h)) for h in hyps]
 
     return {
         "scheme": scheme,
@@ -416,7 +415,6 @@ def evaluate_condition(
         "best_alpha": best_alpha,
         "tune_cer": best_tune_cer,
         "eval_cer": cer(refs, hyps),
-        "eval_wer": wer(word_refs, word_hyps),
         "rows": rows,
     }
 
@@ -430,9 +428,7 @@ def compute_baseline(nbest: List[dict], eval_idx: List[int]) -> dict:
         rows.append({"utt_id": item["utt_id"], "ref": item["ref"], "hyp": item["candidates"][0]["text"]})
     refs = [r["ref"] for r in rows]
     hyps = [r["hyp"] for r in rows]
-    word_refs = [" ".join(TOKENIZERS["word"](r)) for r in refs]
-    word_hyps = [" ".join(TOKENIZERS["word"](h)) for h in hyps]
-    return {"cer": cer(refs, hyps), "wer": wer(word_refs, word_hyps), "rows": rows}
+    return {"cer": cer(refs, hyps), "rows": rows}
 
 
 def render_table(baseline: dict, conditions: List[dict]) -> Table:
@@ -442,20 +438,15 @@ def render_table(baseline: dict, conditions: List[dict]) -> Table:
     table.add_column("alpha*", justify="right")
     table.add_column("CER", justify="right")
     table.add_column("RER (CER)", justify="right")
-    table.add_column("WER", justify="right")
-    table.add_column("RER (WER)", justify="right")
-    table.add_row("baseline", "-", "-", f"{baseline['cer']:.4f}", "-", f"{baseline['wer']:.4f}", "-")
+    table.add_row("baseline", "-", "-", f"{baseline['cer']:.4f}", "-")
     for c in conditions:
         rer_cer = (baseline["cer"] - c["eval_cer"]) / baseline["cer"] if baseline["cer"] else float("nan")
-        rer_wer = (baseline["wer"] - c["eval_wer"]) / baseline["wer"] if baseline["wer"] else float("nan")
         table.add_row(
             c["scheme"],
             str(c["order"]),
             f"{c['best_alpha']:.2f}",
             f"{c['eval_cer']:.4f}",
             f"{rer_cer:+.1%}",
-            f"{c['eval_wer']:.4f}",
-            f"{rer_wer:+.1%}",
         )
     return table
 
@@ -610,7 +601,7 @@ def main() -> None:
     print(f"tune={len(tune_idx)} eval={len(eval_idx)} utterances")
 
     baseline = compute_baseline(nbest, eval_idx)
-    print(f"Baseline: CER={baseline['cer']:.4f} WER={baseline['wer']:.4f}")
+    print(f"Baseline: CER={baseline['cer']:.4f}")
 
     scorers = load_scorers(args.lm_dir, args.schemes, args.orders)
 
@@ -628,10 +619,7 @@ def main() -> None:
                 nbest, tune_idx, eval_idx, scheme, order, scorers[(scheme, order)], args.alpha_grid, tokens_cache
             )
             conditions.append(result)
-            print(
-                f"  alpha*={result['best_alpha']:.2f} eval_cer={result['eval_cer']:.4f} "
-                f"eval_wer={result['eval_wer']:.4f}"
-            )
+            print(f"  alpha*={result['best_alpha']:.2f} eval_cer={result['eval_cer']:.4f}")
 
     console = Console()
     table = render_table(baseline, conditions)

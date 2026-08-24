@@ -165,7 +165,7 @@ Default ASR model is `junsor/whisper-small-aishell`; pass `--asr-model` to use
 your own fine-tune. `--dtype` defaults to `auto`, which resolves to `float16`
 on CUDA (roughly half the memory/time of `float32` for a beam-search-heavy
 workload like this — important on Jetson) and `float32` on CPU. Results
-(per-condition CER/WER/RER, `nbest.json`, `run_config.json`) are saved under
+(per-condition CER/RER, `nbest.json`, `run_config.json`) are saved under
 `./logs/aishell_ngram_fusion/`.
 
 #### Jetson: crashes / resuming
@@ -289,10 +289,11 @@ uv run analyze_aishell_ngram_fusion.py --run-dir ./logs/aishell_ngram_fusion
 
 - **Metric.** Alpha is always tuned to minimize CER (segmentation-tool
   independent, the standard metric for Chinese) for *both* schemes, so
-  RER(CER) is directly comparable across char vs. word conditions. Jieba-based
-  WER (re-segmenting both ref and hyp with the same tokenizer — not the
-  dataset's own pre-baked word boundaries) is reported per condition as a
-  secondary diagnostic, using that same CER-tuned alpha.
+  RER(CER) is directly comparable across char vs. word conditions. WER is
+  deliberately not computed anywhere in this pipeline: Mandarin has no native
+  word boundaries, so any "word" only exists relative to an arbitrary
+  segmentation tool's choices - unlike CER, it wouldn't be measuring
+  something intrinsic to the text.
 - **RER.** `(baseline_error - condition_error) / baseline_error`, computed on
   the eval slice; `alpha=0` reproduces the no-LM baseline for every order as a
   built-in sanity check.
