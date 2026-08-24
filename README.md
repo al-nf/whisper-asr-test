@@ -304,8 +304,16 @@ code changes are needed; the differences are all CLI flags plus which
 
 - `--text-column transcript --id-column id` (MDCC's schema differs from the
   `Serenalay/AISHELL-1` mirror's `text`/`name` columns).
-- `--language cantonese` (Whisper's tokenizer has a dedicated Cantonese
-  language token, `yue`, distinct from `chinese`/`zh`).
+- **Not** `--language cantonese`, unless your checkpoint is derived from
+  `whisper-large-v3`/`-turbo` specifically. Whisper only added a real
+  `<|yue|>` (Cantonese) token in large-v3; every smaller size (tiny through
+  large-v2) has no dedicated Cantonese token at all, so tiny/base/small/medium
+  Cantonese fine-tunes (like the one recommended below) were necessarily
+  trained to map Cantonese audio onto `<|zh|>` (Chinese) text, same as any
+  Mandarin fine-tune - so `--language chinese` is correct for those. The
+  script auto-detects this (from the checkpoint's architecture) and falls
+  back with a warning if you pass `cantonese`/`yue` on a non-large-v3 model,
+  but it's clearer to just pass `chinese` directly for these checkpoints.
 - `--lang yue`, which swaps the "word" tokenizer from `jieba` (Mandarin) to
   [`pycantonese.segment`](https://docs.pycantonese.org/stable/word_segmentation.html)
   - a DAG+HMM segmenter trained on real Cantonese corpora (HKCanCor,
@@ -343,9 +351,20 @@ needed):
 ```
 uv run eval_aishell_ngram_fusion.py \
     --dataset-repo ming030890/mdcc --text-column transcript --id-column id \
-    --lang yue --language cantonese --lm-dir ./lm_yue \
+    --lang yue --language chinese --lm-dir ./lm_yue \
     --asr-model Oblivion208/whisper-small-cantonese
 ```
+
+If you see `ValueError: The generation config is outdated...` on first run,
+that's unrelated to the language choice above - it means this specific
+checkpoint's `generation_config.json` predates
+[huggingface/transformers#25298](https://github.com/huggingface/transformers/issues/25084)
+and is missing the `lang_to_id`/`task_to_id` token maps that `--language`/
+`--task` rely on. The script detects and auto-repairs this in memory (by
+borrowing those maps from the official same-size Whisper checkpoint) with a
+`[warn]` message; if you still hit the error, your `transformers` version
+may be too old to have `model.config.d_model`/`encoder_layers`/`num_mel_bins`
+match one of the known architectures - upgrade `transformers` and retry.
 
 This downloads the full `test` split (12492 utterances, audio included) on
 first run; use `--max-samples 200` to iterate quickly first. Everything else

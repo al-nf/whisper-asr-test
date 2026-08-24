@@ -5,10 +5,15 @@ word-segmented (jieba) tokenization.
 
 Benchmark: AISHELL-1 test set (`Serenalay/AISHELL-1`, 7176 utterances) by
 default. Also usable for Cantonese via `--lang yue --dataset-repo
-ming030890/mdcc --text-column transcript --id-column id --language cantonese
---asr-model <cantonese checkpoint>` - see README for the full Cantonese
-walkthrough. `--lang` only changes the "word" tokenizer (jieba for zh,
+ming030890/mdcc --text-column transcript --id-column id --asr-model
+<cantonese checkpoint>` - see README for the full Cantonese walkthrough.
+`--lang` only changes the "word" tokenizer (jieba for zh,
 pycantonese.segment for yue); "char" tokenization is identical either way.
+Note: only whisper-large-v3/-turbo-derived checkpoints have a real
+`<|yue|>` language token (added in large-v3); tiny/base/small/medium
+Cantonese fine-tunes were trained against `<|zh|>` like any Mandarin
+fine-tune, so `--language` should stay `chinese` for those (the script
+auto-detects and falls back if you pass `cantonese`/`yue` on such a model).
 Model: a fine-tuned Whisper checkpoint (default: `junsor/whisper-small-aishell`).
 
 Fusion mechanism: N-best rescoring, not shallow fusion during beam search.
@@ -74,7 +79,7 @@ from jiwer import cer
 from rich.console import Console
 from rich.table import Table
 from tqdm import tqdm
-from transformers import WhisperForConditionalGeneration, WhisperProcessor
+from transformers import GenerationConfig, WhisperForConditionalGeneration, WhisperProcessor
 
 from ngram_lm import KenLMScorer, TOKENIZERS, get_tokenizers, normalize_zh_text
 
@@ -90,6 +95,86 @@ DEFAULT_SCHEMES = ["char", "word"]
 DEFAULT_ALPHA_GRID = [0.0, 0.1, 0.2, 0.3, 0.5, 0.7, 1.0, 1.5, 2.0]
 
 DTYPE_MAP = {"float32": torch.float32, "float16": torch.float16, "bfloat16": torch.bfloat16}
+
+
+# Keyed by (d_model, encoder_layers, num_mel_bins) - these three uniquely
+# identify every official Whisper architecture size, including telling
+# large-v3/large-v3-turbo (128 mel bins, 100 language tokens incl. `<|yue|>`)
+# apart from large-v1/v2 (80 mel bins, 99 tokens, no dedicated Cantonese token).
+_WHISPER_BASE_REPO_BY_ARCH = {
+    (384, 4, 80): "openai/whisper-tiny",
+    (512, 6, 80): "openai/whisper-base",
+    (768, 12, 80): "openai/whisper-small",
+    (1024, 24, 80): "openai/whisper-medium",
+    (1280, 32, 80): "openai/whisper-large-v2",
+    (1280, 32, 128): "openai/whisper-large-v3",
+}
+
+
+def _infer_base_whisper_repo(model) -> Optional[str]:
+    cfg = model.config
+    key = (cfg.d_model, cfg.encoder_layers, cfg.num_mel_bins)
+    return _WHISPER_BASE_REPO_BY_ARCH.get(key)
+
+
+def ensure_multilingual_generation_config(model, asr_model_name: str) -> None:
+    """Some Whisper fine-tunes (typically ones saved in 2023, before
+    huggingface/transformers#25298) ship a `generation_config.json` that's
+    missing `lang_to_id`/`task_to_id` entirely, because those fields were
+    added to the base checkpoints' configs *after* the fine-tune was
+    uploaded. Passing `language=`/`task=` to `.generate()` on such a
+    checkpoint raises `ValueError: The generation config is outdated...`
+    (see https://github.com/huggingface/transformers/issues/25084).
+
+    Patches `model.generation_config` in place (in memory only - never
+    pushed to the Hub, and no model weights are touched) by borrowing the
+    token-id mappings from the official checkpoint of matching architecture
+    size, which is exactly the fix the transformers maintainers recommend in
+    that issue."""
+    if getattr(model.generation_config, "lang_to_id", None):
+        return
+    base_repo = _infer_base_whisper_repo(model)
+    if base_repo is None:
+        print(
+            f"[warn] {asr_model_name}'s generation_config.json is missing lang_to_id/task_to_id "
+            "(see https://github.com/huggingface/transformers/issues/25084) and its architecture doesn't "
+            "match a known Whisper size, so it can't be auto-repaired. --language/--task will likely fail."
+        )
+        return
+    print(
+        f"[warn] {asr_model_name}'s generation_config.json is missing lang_to_id/task_to_id (an outdated "
+        f"fine-tuned-checkpoint issue, transformers#25084) - borrowing them from {base_repo} in memory so "
+        "--language/--task work. No model weights are changed."
+    )
+    base_config = GenerationConfig.from_pretrained(base_repo)
+    for attr in ("lang_to_id", "task_to_id", "is_multilingual"):
+        if hasattr(base_config, attr):
+            setattr(model.generation_config, attr, getattr(base_config, attr))
+
+
+def resolve_language_for_model(model, asr_model_name: str, language: str) -> str:
+    """Only whisper-large-v3/large-v3-turbo-derived checkpoints have a real
+    `<|yue|>` (Cantonese) token - Whisper's original 99-language set (tiny
+    through large-v2) has no dedicated Cantonese token at all, so
+    tiny/base/small/medium Cantonese fine-tunes (e.g.
+    Oblivion208/whisper-small-cantonese) were necessarily trained to map
+    Cantonese audio onto `<|zh|>` (Chinese) text, same as a Mandarin
+    fine-tune. Passing `--language cantonese` to one of those would fail (no
+    `<|yue|>` token to force) or silently do the wrong thing; fall back to
+    `chinese` and say so."""
+    if language not in ("cantonese", "yue"):
+        return language
+    lang_to_id = getattr(model.generation_config, "lang_to_id", None) or {}
+    if "<|yue|>" in lang_to_id:
+        return language
+    print(
+        f"[warn] {asr_model_name} has no dedicated Cantonese ('<|yue|>') token - only "
+        "large-v3/large-v3-turbo-derived Whisper checkpoints do. This model was fine-tuned to map "
+        "Cantonese audio onto Chinese ('<|zh|>') text like any small/base/medium Cantonese Whisper "
+        "fine-tune. Falling back to --language chinese; use a large-v3-based checkpoint if you need "
+        "the real yue token."
+    )
+    return "chinese"
 
 
 def get_run_dir(lang: str = "zh") -> str:
@@ -615,6 +700,12 @@ def main() -> None:
                 args.asr_model, torch_dtype=DTYPE_MAP[dtype_name]
             ).to(args.device)
         model.eval()
+        ensure_multilingual_generation_config(model, args.asr_model)
+        resolved_language = resolve_language_for_model(model, args.asr_model, args.language)
+        if resolved_language != args.language:
+            args.language = resolved_language
+            run_config["language"] = resolved_language
+            save_json(run_config_path, run_config)
 
         checkpoint_path = os.path.join(run_dir, "nbest.json")
         diversity_opts = {
