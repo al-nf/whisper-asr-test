@@ -217,9 +217,10 @@ def main() -> None:
     for conditions in conditions_by_scheme.values():
         conditions.sort(key=lambda c: c["order"])
 
+    dataset_repo = results.get("run_config", {}).get("dataset_repo", "AISHELL-1")
     console = Console()
     console.print(
-        f"[bold]AISHELL-1 n-gram fusion analysis[/bold] "
+        f"[bold]{dataset_repo} n-gram fusion analysis[/bold] "
         f"(n_eval={results['n_eval']}, bootstrap={args.bootstrap} resamples)\n"
     )
     for scheme, conditions in conditions_by_scheme.items():

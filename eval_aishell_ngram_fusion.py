@@ -3,7 +3,12 @@ LM fusion, vs. the 5-gram order WhisperLM-style approaches typically use for
 space-delimited languages, and whether that depends on character- vs.
 word-segmented (jieba) tokenization.
 
-Benchmark: AISHELL-1 test set (`Serenalay/AISHELL-1`, 7176 utterances).
+Benchmark: AISHELL-1 test set (`Serenalay/AISHELL-1`, 7176 utterances) by
+default. Also usable for Cantonese via `--lang yue --dataset-repo
+ming030890/mdcc --text-column transcript --id-column id --language cantonese
+--asr-model <cantonese checkpoint>` - see README for the full Cantonese
+walkthrough. `--lang` only changes the "word" tokenizer (jieba for zh,
+pycantonese.segment for yue); "char" tokenization is identical either way.
 Model: a fine-tuned Whisper checkpoint (default: `junsor/whisper-small-aishell`).
 
 Fusion mechanism: N-best rescoring, not shallow fusion during beam search.
@@ -71,7 +76,7 @@ from rich.table import Table
 from tqdm import tqdm
 from transformers import WhisperForConditionalGeneration, WhisperProcessor
 
-from ngram_lm import KenLMScorer, TOKENIZERS, normalize_zh_text
+from ngram_lm import KenLMScorer, TOKENIZERS, get_tokenizers, normalize_zh_text
 
 DATASET_REPO = "Serenalay/AISHELL-1"
 DEFAULT_ASR_MODEL = "junsor/whisper-small-aishell"
@@ -87,8 +92,9 @@ DEFAULT_ALPHA_GRID = [0.0, 0.1, 0.2, 0.3, 0.5, 0.7, 1.0, 1.5, 2.0]
 DTYPE_MAP = {"float32": torch.float32, "float16": torch.float16, "bfloat16": torch.bfloat16}
 
 
-def get_run_dir() -> str:
-    base = os.path.join("./logs", "aishell_ngram_fusion")
+def get_run_dir(lang: str = "zh") -> str:
+    name = "aishell_ngram_fusion" if lang == "zh" else f"{lang}_ngram_fusion"
+    base = os.path.join("./logs", name)
     os.makedirs("./logs", exist_ok=True)
     if not os.path.exists(base):
         os.makedirs(base)
@@ -151,6 +157,8 @@ def _run_batch(
     language: str,
     task: str,
     diversity_opts: Optional[dict] = None,
+    id_column: str = "name",
+    text_column: str = "text",
 ) -> List[dict]:
     """Runs beam search (or sampling) on a single (small) chunk of the
     dataset. Raises on failure - callers handle OOM-style retries.
@@ -236,8 +244,8 @@ def _run_batch(
         )
         out.append(
             {
-                "utt_id": sub_dataset["name"][i],
-                "ref": normalize_zh_text(sub_dataset["text"][i]),
+                "utt_id": sub_dataset[id_column][i],
+                "ref": normalize_zh_text(sub_dataset[text_column][i]),
                 "candidates": candidates,
             }
         )
@@ -268,13 +276,18 @@ def _run_batch_with_retry(
     language: str,
     task: str,
     diversity_opts: Optional[dict] = None,
+    id_column: str = "name",
+    text_column: str = "text",
 ) -> List[dict]:
     """Runs `_run_batch`, and on a CUDA OOM / Jetson NVML-allocator error
     (see module docstring), frees memory and retries with the batch split in
     half - down to single utterances. A single utterance that still fails
     is recorded with an empty hypothesis rather than aborting the whole run."""
     try:
-        return _run_batch(model, processor, device, sub_dataset, num_beams, max_new_tokens, language, task, diversity_opts)
+        return _run_batch(
+            model, processor, device, sub_dataset, num_beams, max_new_tokens, language, task, diversity_opts,
+            id_column, text_column,
+        )
     except RuntimeError as e:
         if not _is_recoverable_cuda_error(e):
             raise
@@ -283,12 +296,12 @@ def _run_batch_with_retry(
             torch.cuda.empty_cache()
         n = len(sub_dataset)
         if n <= 1:
-            utt_id = sub_dataset["name"][0]
+            utt_id = sub_dataset[id_column][0]
             tqdm.write(f"  [warn] utt_id={utt_id} failed even at batch size 1 ({e}); recording empty hypothesis.")
             return [
                 {
                     "utt_id": utt_id,
-                    "ref": normalize_zh_text(sub_dataset["text"][0]),
+                    "ref": normalize_zh_text(sub_dataset[text_column][0]),
                     "candidates": [{"text": "", "acoustic_avg_logprob": 0.0}],
                 }
             ]
@@ -297,9 +310,11 @@ def _run_batch_with_retry(
         left = sub_dataset.select(range(0, mid))
         right = sub_dataset.select(range(mid, n))
         return _run_batch_with_retry(
-            model, processor, device, left, num_beams, max_new_tokens, language, task, diversity_opts
+            model, processor, device, left, num_beams, max_new_tokens, language, task, diversity_opts,
+            id_column, text_column,
         ) + _run_batch_with_retry(
-            model, processor, device, right, num_beams, max_new_tokens, language, task, diversity_opts
+            model, processor, device, right, num_beams, max_new_tokens, language, task, diversity_opts,
+            id_column, text_column,
         )
 
 
@@ -315,6 +330,8 @@ def generate_nbest(
     task: str,
     checkpoint_path: Optional[str] = None,
     diversity_opts: Optional[dict] = None,
+    id_column: str = "name",
+    text_column: str = "text",
 ) -> List[dict]:
     """Runs Whisper beam search once per utterance, keeping the top `num_beams`
     candidates and their length-normalized acoustic log-probs. This is the
@@ -325,7 +342,7 @@ def generate_nbest(
     (keyed by utt_id, so order-independent), and any utterances already
     present there at startup are skipped - i.e. re-running with the same
     `checkpoint_path` after a crash resumes instead of starting over."""
-    full_names = list(dataset["name"])
+    full_names = [str(x) for x in dataset[id_column]]
     results_by_id: "dict[str, dict]" = {}
     if checkpoint_path and os.path.exists(checkpoint_path):
         with open(checkpoint_path, "r", encoding="utf-8") as f:
@@ -342,9 +359,11 @@ def generate_nbest(
             end = min(start + batch_size, len(subset))
             sub = subset.select(range(start, end))
             batch_results = _run_batch_with_retry(
-                model, processor, device, sub, num_beams, max_new_tokens, language, task, diversity_opts
+                model, processor, device, sub, num_beams, max_new_tokens, language, task, diversity_opts,
+                id_column, text_column,
             )
             for item in batch_results:
+                item["utt_id"] = str(item["utt_id"])
                 results_by_id[item["utt_id"]] = item
             if checkpoint_path:
                 ordered_so_far = [results_by_id[name] for name in full_names if name in results_by_id]
@@ -361,7 +380,8 @@ def load_scorers(lm_dir: str, schemes: List[str], orders: List[int]) -> "dict[tu
             if not os.path.exists(path):
                 raise FileNotFoundError(
                     f"Missing KenLM model: {path}\n"
-                    "Run prepare_aishell_lm_corpus.py then scripts/build_kenlm_models.sh first."
+                    "Run prepare_aishell_lm_corpus.py (or prepare_mdcc_lm_corpus.py for Cantonese) then "
+                    f"'bash scripts/build_kenlm_models.sh <corpus_dir> {lm_dir}' first."
                 )
             scorers[(scheme, order)] = KenLMScorer(path)
     return scorers
@@ -431,8 +451,8 @@ def compute_baseline(nbest: List[dict], eval_idx: List[int]) -> dict:
     return {"cer": cer(refs, hyps), "rows": rows}
 
 
-def render_table(baseline: dict, conditions: List[dict]) -> Table:
-    table = Table(title="AISHELL-1 N-gram Fusion Results (N-best rescoring)")
+def render_table(baseline: dict, conditions: List[dict], title: str = "AISHELL-1 N-gram Fusion Results (N-best rescoring)") -> Table:
+    table = Table(title=title)
     table.add_column("Scheme", justify="left")
     table.add_column("Order", justify="right")
     table.add_column("alpha*", justify="right")
@@ -456,6 +476,23 @@ def parse_args() -> argparse.Namespace:
         description="Measure RER per n-gram order/tokenization scheme for Whisper+KenLM fusion on AISHELL-1."
     )
     parser.add_argument("--asr-model", default=DEFAULT_ASR_MODEL, help="HF transformers Whisper checkpoint id/path.")
+    parser.add_argument(
+        "--dataset-repo",
+        default=DATASET_REPO,
+        help="HF datasets repo to evaluate on. Default is the AISHELL-1 (Mandarin) mirror; pass "
+        "'ming030890/mdcc' (with --dataset-split test --text-column transcript --id-column id "
+        "--language cantonese) to run the same test on Cantonese.",
+    )
+    parser.add_argument("--dataset-split", default="test", help="Split of --dataset-repo to evaluate on.")
+    parser.add_argument("--text-column", default="text", help="Dataset column holding the reference transcript.")
+    parser.add_argument("--id-column", default="name", help="Dataset column holding a unique utterance id.")
+    parser.add_argument(
+        "--lang",
+        choices=["zh", "yue"],
+        default="zh",
+        help="Selects the 'word' tokenizer: jieba for Mandarin (zh) or pycantonese.segment for Cantonese (yue). "
+        "'char' tokenization is identical either way. Use 'yue' together with --dataset-repo ming030890/mdcc.",
+    )
     parser.add_argument("--lm-dir", default="./lm", help="Directory containing {char,word}/order{n}.klm KenLM binaries.")
     parser.add_argument("--orders", nargs="+", type=int, default=DEFAULT_ORDERS)
     parser.add_argument("--schemes", nargs="+", choices=list(TOKENIZERS), default=DEFAULT_SCHEMES)
@@ -518,11 +555,17 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    if args.lang == "yue" and args.asr_model == DEFAULT_ASR_MODEL:
+        print(
+            f"[warn] --lang yue but --asr-model is still the Mandarin default ({DEFAULT_ASR_MODEL}). "
+            "Pass a Cantonese-finetuned checkpoint, e.g. --asr-model Oblivion208/whisper-small-cantonese "
+            "(see README)."
+        )
     if args.run_dir:
         run_dir = args.run_dir
         os.makedirs(run_dir, exist_ok=True)
     else:
-        run_dir = get_run_dir()
+        run_dir = get_run_dir(args.lang)
     print(f"Saving logs to: {run_dir}")
 
     dtype_name = "float16" if args.dtype == "auto" and args.device.startswith("cuda") else args.dtype
@@ -556,8 +599,8 @@ def main() -> None:
         with open(args.nbest_cache, "r", encoding="utf-8") as f:
             nbest = json.load(f)
     else:
-        print(f"Loading dataset: {DATASET_REPO} (test split)")
-        dataset = load_dataset(DATASET_REPO, split="test")
+        print(f"Loading dataset: {args.dataset_repo} ({args.dataset_split} split)")
+        dataset = load_dataset(args.dataset_repo, split=args.dataset_split)
         if args.max_samples is not None:
             dataset = dataset.select(range(min(args.max_samples, len(dataset))))
 
@@ -594,6 +637,8 @@ def main() -> None:
             task=args.task,
             checkpoint_path=checkpoint_path,
             diversity_opts=diversity_opts,
+            id_column=args.id_column,
+            text_column=args.text_column,
         )
         save_json(checkpoint_path, nbest)
 
@@ -605,9 +650,10 @@ def main() -> None:
 
     scorers = load_scorers(args.lm_dir, args.schemes, args.orders)
 
+    tokenizers = get_tokenizers(args.lang)
     conditions = []
     for scheme in args.schemes:
-        tokenize = TOKENIZERS[scheme]
+        tokenize = tokenizers[scheme]
         print(f"Tokenizing N-best candidates for scheme={scheme}...")
         tokens_cache = [
             [tokenize(c["text"]) for c in item["candidates"]]
@@ -622,7 +668,7 @@ def main() -> None:
             print(f"  alpha*={result['best_alpha']:.2f} eval_cer={result['eval_cer']:.4f}")
 
     console = Console()
-    table = render_table(baseline, conditions)
+    table = render_table(baseline, conditions, title=f"{args.dataset_repo} N-gram Fusion Results (N-best rescoring)")
     console.print(table)
 
     record_console = Console(record=True, highlight=False)

@@ -88,14 +88,20 @@ uv run analyze_llm_postprocess.py --run-dir ./logs/llm_postprocess --show-exampl
 ## AISHELL-1 n-gram order/tokenization fusion test
 
 **Hypothesis:** WhisperLM-style fusion typically uses a 5-gram LM (tuned for
-space-delimited languages). Mandarin's character/word statistics may instead
-favor a much lower order (bigram/trigram) — this experiment measures the
-relative error-rate reduction (RER) from fusing orders 2-5 with a fine-tuned
-Whisper on AISHELL-1, separately for character-segmented and jieba
-word-segmented LMs, to confirm or refute that. (Order 1 is excluded: KenLM's
-query/loading code hard-requires at least a bigram model, even though
-`lmplz` can technically produce a unigram ARPA file. The no-LM beam-search
-baseline already serves as the effective "0th order" comparison point.)
+space-delimited languages). Chinese languages' character/word statistics may
+instead favor a much lower order (bigram/trigram) — this experiment measures
+the relative error-rate reduction (RER) from fusing orders 2-5 with a
+fine-tuned Whisper, separately for character-segmented and word-segmented
+LMs, to confirm or refute that. (Order 1 is excluded: KenLM's query/loading
+code hard-requires at least a bigram model, even though `lmplz` can
+technically produce a unigram ARPA file. The no-LM beam-search baseline
+already serves as the effective "0th order" comparison point.)
+
+The steps below walk through the Mandarin/AISHELL-1 setup; the whole
+pipeline (`eval_aishell_ngram_fusion.py`, `analyze_aishell_ngram_fusion.py`,
+`diagnose_nbest.py`) is dataset/language-agnostic and reused as-is for
+Cantonese/MDCC - see [Running the same test on Cantonese
+(MDCC)](#running-the-same-test-on-cantonese-mdcc) below.
 
 **Fusion mechanism: N-best rescoring, not shallow fusion during beam search.**
 Whisper's BPE tokens don't align to Chinese characters or jieba words, so
@@ -285,15 +291,84 @@ includes 2 or 3 (hypothesis supported) or not (refuted):
 uv run analyze_aishell_ngram_fusion.py --run-dir ./logs/aishell_ngram_fusion
 ```
 
+### Running the same test on Cantonese (MDCC)
+
+The exact same experiment (N-best generation, KenLM rescoring, alpha tuning,
+RER + bootstrap verdict) runs on Cantonese by pointing the pipeline at
+[`ming030890/mdcc`](https://huggingface.co/datasets/ming030890/mdcc) - a
+mirror of the [Multi-Domain Cantonese Corpus](https://arxiv.org/abs/2201.02419)
+(MDCC) with clean `train`/`validation`/`test` splits (65120/5663/12492
+utterances) that are directly comparable in scale to AISHELL-1. No dataset
+code changes are needed; the differences are all CLI flags plus which
+"word" segmenter is used:
+
+- `--text-column transcript --id-column id` (MDCC's schema differs from the
+  `Serenalay/AISHELL-1` mirror's `text`/`name` columns).
+- `--language cantonese` (Whisper's tokenizer has a dedicated Cantonese
+  language token, `yue`, distinct from `chinese`/`zh`).
+- `--lang yue`, which swaps the "word" tokenizer from `jieba` (Mandarin) to
+  [`pycantonese.segment`](https://docs.pycantonese.org/stable/word_segmentation.html)
+  - a DAG+HMM segmenter trained on real Cantonese corpora (HKCanCor,
+    rime-cantonese, Common Voice Cantonese). Plain jieba's dictionary is
+    Mandarin-specific and mis-segments (or degenerates toward char-level on)
+    Cantonese-only vocabulary and particles (`嘅`/`喺`/`佢`/`唔`/`啦` etc.), so
+    reusing it for the Cantonese "word" scheme would bias that condition.
+    `--lang` doesn't affect "char" tokenization, which is identical either way.
+- A separate `--lm-dir` (e.g. `./lm_yue`) so the Cantonese KenLM binaries
+  don't collide with the Mandarin ones under `./lm`.
+
+**1. Build the Cantonese LM corpus.** Unlike AISHELL-1 (whose eval mirror
+only ships a `test` split, so the LM corpus has to come from a separately
+downloaded official transcript dump with test ids excluded by hand), MDCC's
+mirror already has disjoint splits - so this just loads `train`+`validation`
+directly and skips `test` (the split evaluated on below):
+
+```
+uv run prepare_mdcc_lm_corpus.py --output-dir ./lm_corpus_yue
+```
+
+**2. Train the KenLM models** (same script as Mandarin, pointed at the
+Cantonese corpus/output dirs):
+
+```
+bash scripts/build_kenlm_models.sh ./lm_corpus_yue ./lm_yue
+```
+
+**3. Run the fusion eval**, with a Cantonese-finetuned Whisper checkpoint
+(e.g. [`Oblivion208/whisper-small-cantonese`](https://huggingface.co/Oblivion208/whisper-small-cantonese),
+a full fine-tune - not a LoRA adapter, so it loads with the same
+`from_pretrained` path as `junsor/whisper-small-aishell`, no PEFT merging
+needed):
+
+```
+uv run eval_aishell_ngram_fusion.py \
+    --dataset-repo ming030890/mdcc --text-column transcript --id-column id \
+    --lang yue --language cantonese --lm-dir ./lm_yue \
+    --asr-model Oblivion208/whisper-small-cantonese
+```
+
+This downloads the full `test` split (12492 utterances, audio included) on
+first run; use `--max-samples 200` to iterate quickly first. Everything else
+- OOM-safe checkpointed generation, `--num-beam-groups`/`--do-sample` for
+beam collapse, `diagnose_nbest.py`, `--nbest-cache` - works identically to
+the Mandarin walkthrough above.
+
+**4. Analyze** exactly as before, just pointed at the Cantonese run dir
+(auto-named `./logs/yue_ngram_fusion` since `--run-dir` wasn't given above):
+
+```
+uv run analyze_aishell_ngram_fusion.py --run-dir ./logs/yue_ngram_fusion
+```
+
 ### Methodology notes
 
 - **Metric.** Alpha is always tuned to minimize CER (segmentation-tool
   independent, the standard metric for Chinese) for *both* schemes, so
   RER(CER) is directly comparable across char vs. word conditions. WER is
-  deliberately not computed anywhere in this pipeline: Mandarin has no native
-  word boundaries, so any "word" only exists relative to an arbitrary
-  segmentation tool's choices - unlike CER, it wouldn't be measuring
-  something intrinsic to the text.
+  deliberately not computed anywhere in this pipeline: Chinese languages have
+  no native word boundaries, so any "word" only exists relative to an
+  arbitrary segmentation tool's choices - unlike CER, it wouldn't be
+  measuring something intrinsic to the text.
 - **RER.** `(baseline_error - condition_error) / baseline_error`, computed on
   the eval slice; `alpha=0` reproduces the no-LM baseline for every order as a
   built-in sanity check.
