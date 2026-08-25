@@ -254,6 +254,15 @@ exclusive - HF gives diverse beam search priority if both are set):
 # Diverse beam search: groups beams, penalizes cross-group similarity at every step.
 # Deterministic; guarantees distinct candidates, but the diversity is an artificial
 # penalty rather than the model's own uncertainty.
+#
+# NOTE: on transformers >= ~4.62/5.x, group beam search was extracted out of
+# the core library into a Hub-hosted `custom_generate` repo
+# (https://hf.co/transformers-community/group-beam-search); the script passes
+# `trust_remote_code=True` for you when `--num-beam-groups > 1`, but that
+# means the *first* run with this flag needs network access to download and
+# cache that code (subsequent runs reuse the cache). If your Jetson has no
+# internet access at eval time, either pre-fetch it once while online, or use
+# `--do-sample` instead (no remote code involved).
 uv run eval_aishell_ngram_fusion.py --num-beams 5 --num-beam-groups 5 --diversity-penalty 0.5
 
 # Independent multinomial sampling: --num-beams candidates sampled independently

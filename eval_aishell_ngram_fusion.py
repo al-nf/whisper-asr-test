@@ -323,6 +323,14 @@ def _run_batch(
     if num_beam_groups > 1:
         generate_kwargs["num_beam_groups"] = num_beam_groups
         generate_kwargs["diversity_penalty"] = opts.get("diversity_penalty", 0.0)
+        # transformers >= ~4.62/5.x extracted less-common generation strategies
+        # (incl. group beam search) into Hub-hosted `custom_generate` repos to
+        # slim down the core library; using them now requires this explicit
+        # opt-in (it downloads/executes
+        # https://hf.co/transformers-community/group-beam-search once, then
+        # caches it - see "ValueError: Group Beam Search requires
+        # trust_remote_code=True..." if this wasn't set).
+        generate_kwargs["trust_remote_code"] = True
     elif opts.get("do_sample"):
         generate_kwargs["do_sample"] = True
         generate_kwargs["temperature"] = opts.get("temperature", 1.0)
