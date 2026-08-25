@@ -60,6 +60,7 @@ import argparse
 import gc
 import json
 import os
+import re
 
 # Must be set before CUDA is initialized. On Jetson/Tegra, PyTorch's caching
 # allocator can hit contiguous-memory (CMA) exhaustion under repeated
@@ -232,6 +233,35 @@ def _transition_avg_logprobs(model, sequences: "torch.Tensor", scores: tuple) ->
     return avg_logprobs
 
 
+_WHISPER_CONTROL_TOKEN_RE = re.compile(r"<\|[^|>]*\|>")
+_warned_leaked_control_tokens = False
+
+
+def _strip_leaked_control_tokens(text: str) -> str:
+    """`processor.batch_decode(..., skip_special_tokens=True)` relies on each
+    added token's own `special` flag in the tokenizer's added-tokens table.
+    Some Whisper fine-tunes (e.g. `Oblivion208/whisper-small-cantonese`) ship
+    a tokenizer where control tokens like `<|startoftranscript|>`/`<|zh|>`/
+    `<|transcribe|>`/`<|notimestamps|>` are present but marked
+    `special=False`, so they leak into the decoded text verbatim - silently
+    prepending ~50 characters of garbage to every hypothesis and inflating
+    CER past 100% (`normalize_zh_text` strips the `<|>` punctuation but not
+    the alphanumeric token names themselves). `<|...|>` markup never appears
+    in legitimate transcript text, so stripping it unconditionally here is a
+    safe no-op for checkpoints that don't have this bug."""
+    cleaned = _WHISPER_CONTROL_TOKEN_RE.sub("", text)
+    global _warned_leaked_control_tokens
+    if cleaned != text and not _warned_leaked_control_tokens:
+        _warned_leaked_control_tokens = True
+        print(
+            "[warn] Decoded text contained literal Whisper control-token markup (e.g. "
+            "'<|startoftranscript|>') even with skip_special_tokens=True - this checkpoint's "
+            "tokenizer marks those tokens as non-special. Stripped automatically; if you see this, "
+            "double-check other tooling you point at this checkpoint does the same."
+        )
+    return cleaned
+
+
 def _run_batch(
     model,
     processor,
@@ -306,7 +336,10 @@ def _run_batch(
     with torch.no_grad():
         output = model.generate(input_features, **generate_kwargs)
 
-    texts = processor.batch_decode(output.sequences, skip_special_tokens=True)
+    texts = [
+        _strip_leaked_control_tokens(t)
+        for t in processor.batch_decode(output.sequences, skip_special_tokens=True)
+    ]
     sequences_scores = getattr(output, "sequences_scores", None)
     if sequences_scores is not None:
         scores = sequences_scores.tolist()
