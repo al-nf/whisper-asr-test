@@ -101,7 +101,10 @@ The steps below walk through the Mandarin/AISHELL-1 setup; the whole
 pipeline (`eval_aishell_ngram_fusion.py`, `analyze_aishell_ngram_fusion.py`,
 `diagnose_nbest.py`) is dataset/language-agnostic and reused as-is for
 Cantonese/MDCC - see [Running the same test on Cantonese
-(MDCC)](#running-the-same-test-on-cantonese-mdcc) below.
+(MDCC)](#running-the-same-test-on-cantonese-mdcc) - and as a negative
+control on English/LibriSpeech - see [English negative control
+(LibriSpeech)](#english-negative-control-librispeech). Hakka is documented
+separately and currently blocked on gated data.
 
 **Fusion mechanism: N-best rescoring, not shallow fusion during beam search.**
 Whisper's BPE tokens don't align to Chinese characters or jieba words, so
@@ -247,28 +250,31 @@ fine-tuned audio are typically far more peaked than open-ended text
 generation, so there's nothing left in the N-best list for *any* LM, order,
 or alpha to rescore between.
 
-Two ways to force genuine diversity when generating N-best (mutually
-exclusive - HF gives diverse beam search priority if both are set):
+Two diversity mechanisms exist (mutually exclusive - HF gives diverse beam
+search priority if both are set), but **only one of them is currently known
+to actually work**:
 
 ```
-# Diverse beam search: groups beams, penalizes cross-group similarity at every step.
-# Deterministic; guarantees distinct candidates, but the diversity is an artificial
-# penalty rather than the model's own uncertainty.
-#
-# NOTE: on transformers >= ~4.62/5.x, group beam search was extracted out of
-# the core library into a Hub-hosted `custom_generate` repo
-# (https://hf.co/transformers-community/group-beam-search); the script passes
-# `trust_remote_code=True` for you when `--num-beam-groups > 1`, but that
-# means the *first* run with this flag needs network access to download and
-# cache that code (subsequent runs reuse the cache). If your Jetson has no
-# internet access at eval time, either pre-fetch it once while online, or use
-# `--do-sample` instead (no remote code involved).
-uv run eval_aishell_ngram_fusion.py --num-beams 5 --num-beam-groups 5 --diversity-penalty 0.5
-
-# Independent multinomial sampling: --num-beams candidates sampled independently
-# instead of one deterministic beam search. Note this is *not* beam search at
-# all under the hood - see below - but it's the other diversity knob available.
+# RECOMMENDED: independent multinomial sampling - --num-beams candidates
+# sampled independently instead of one deterministic beam search. Not beam
+# search at all under the hood - see below - but empirically verified (against
+# a real checkpoint + real audio) to produce genuine per-utterance diversity.
 uv run eval_aishell_ngram_fusion.py --num-beams 5 --do-sample --temperature 1.0
+```
+
+```
+# NOT RECOMMENDED (currently broken): diverse beam search groups beams and
+# penalizes cross-group similarity at every step. On transformers >= ~4.62/5.x
+# this was extracted out of the core library into a Hub-hosted `custom_generate`
+# repo (https://hf.co/transformers-community/group-beam-search) - the script
+# passes `trust_remote_code=True` for you when `--num-beam-groups > 1`, which
+# needs network access on first use to download and cache that code. However,
+# testing this directly against a real checkpoint + real audio at
+# diversity_penalty = 0.5, 2.0, 5.0, 10.0, and 20.0 (4 orders of magnitude)
+# produced byte-identical output every time - the mechanism appears to have no
+# effect at all in this transformers version, not just "too weak a penalty."
+# Left here for reference/future debugging, but use --do-sample instead.
+uv run eval_aishell_ngram_fusion.py --num-beams 5 --num-beam-groups 5 --diversity-penalty 2.0
 ```
 
 `--do-sample` is *not* HF's generic "beam-search multinomial sampling" (which
@@ -388,15 +394,167 @@ the Mandarin walkthrough above.
 uv run analyze_aishell_ngram_fusion.py --run-dir ./logs/yue_ngram_fusion
 ```
 
+### English negative control (LibriSpeech)
+
+If Chinese saturates at bigram/trigram *because* character tokens are dense,
+English word n-grams (the setting WhisperLM's 5-gram convention comes from)
+should keep improving through order 4/5. Same pipeline, fully open data.
+
+**Dataset:** [`openslr/librispeech_asr`](https://huggingface.co/datasets/openslr/librispeech_asr)
+`clean` config. LM corpus = `train.100` + `validation` (~31k transcripts);
+eval = `test` (2620 utterances). **Metric is WER**, not CER — English has
+real word boundaries. The `word` scheme (whitespace split) is the actual
+negative control; `char` is included as a diagnostic (letter 5-grams only
+span a few characters).
+
+**Model:** vanilla `openai/whisper-small` (same size as the Mandarin/Cantonese
+runs; not a LibriSpeech fine-tune). Pass `--do-sample` — Whisper-small is
+confident on read speech and will beam-collapse without it, same as AISHELL.
+
+**1. LM corpus** (first run downloads several GB of parquet; audio is
+discarded, text is kept):
+
+```
+uv run prepare_librispeech_lm_corpus.py --output-dir ./lm_corpus_en
+bash scripts/build_kenlm_models.sh ./lm_corpus_en ./lm_en
+```
+
+**2. Fusion eval** (smoke with `--max-samples 100` first, then drop it):
+
+```
+uv run eval_aishell_ngram_fusion.py \
+    --lang en --language english --metric wer \
+    --dataset-repo openslr/librispeech_asr --dataset-config clean \
+    --dataset-split test --text-column text --id-column id \
+    --asr-model openai/whisper-small --lm-dir ./lm_en \
+    --do-sample --temperature 0.5 --max-new-tokens 128
+```
+
+**3. Analyze** — the verdict is inverted vs. Chinese: the negative control
+is supported only if the tied-best order set excludes 2 and 3.
+
+```
+uv run analyze_aishell_ngram_fusion.py --run-dir ./logs/en_ngram_fusion
+```
+
+### Running the same test on Hakka
+
+Hakka is a much rougher path than Cantonese - the open-source tooling is far
+less mature - but the same pipeline runs on it with three structural
+differences from AISHELL-1/MDCC, plus one model-availability caveat you need
+to resolve up front.
+
+**Dataset:**
+[`slammax/formosan_asr_benchmark`](https://huggingface.co/datasets/slammax/formosan_asr_benchmark)'s
+`hakka` config (12016 utterances, `audio_id`/`transcript`/`audio` columns).
+Unlike AISHELL-1/MDCC, this ships **only one `test` split** - there's no
+separate transcript corpus to train the LM on without the LM having
+literally seen the sentences it'll later be asked to disambiguate. So
+`prepare_hakka_lm_corpus.py` self-partitions that one split deterministically
+by utterance id (a stable hash, not a random shuffle - see
+`ngram_lm.is_lm_holdout`): ~70% goes into the LM corpus, and
+`eval_aishell_ngram_fusion.py --lm-holdout-frac 0.3` restricts ASR evaluation
+to exactly the other ~30%, so the LM is never trained on sentences it's later
+scored on. Both scripts must be run with matching `--holdout-frac`/`--seed`
+(defaults already agree: `0.3`/`42`).
+
+**No word segmenter.** There is no Hakka equivalent of jieba/pycantonese - no
+maintained Hakka word-segmentation library exists. `--lang hak` therefore
+only exposes a `"char"` tokenizer; pass `--schemes char` explicitly (the
+script warns loudly if you don't and try to use `"word"` anyway). This means
+Hakka can only test the char-tokenization side of the hypothesis, not the
+word-segmented side.
+
+**Model availability - read this before spending Jetson time.** The one
+*open, non-gated* Hakka Whisper checkpoint found while building this,
+[`NUTN-KWS/Whisper-Taiwanese-Hakka-model-v0.2.6`](https://huggingface.co/NUTN-KWS/Whisper-Taiwanese-Hakka-model-v0.2.6),
+was empirically tested against real `formosan_asr_benchmark` audio during
+development and produces largely garbled/phonetically-adjacent-but-wrong
+output (e.g. reference `前面向右轉就到金門縣政府了` decoded as
+`透前腿轉心腱就多幾問冤真汙了`), even with beam search - almost certainly
+because it was trained mostly on **synthesized TTS Hakka speech** for
+textbook content, and doesn't generalize to this benchmark's real, mic-varied
+recordings. A baseline that garbled would just reproduce the "beam
+collapse"/"control-token leakage" failure mode from earlier in this README:
+no real signal either way on the hypothesis. Every Hakka checkpoint trained
+on **real** speech that could be found -
+[`formospeech/whisper-large-v3-taiwanese-hakka`](https://huggingface.co/formospeech/whisper-large-v3-taiwanese-hakka)
+(6 dialects, HAT-Vol2-derived; ~23% CER pre-fine-tune on its own domain per
+the FSR-2025 challenge papers) and
+[`formospeech/whisper-large-v2-taiwanese-hakka-v1`](https://huggingface.co/formospeech/whisper-large-v2-taiwanese-hakka-v1)
+(single model, ~7-9% CER on Hakka radio news) - is **gated**: request access
+on the model page, log in with `hf auth login` (or set `HF_TOKEN`) with an
+account that's been granted access, then use it like any other checkpoint.
+Since access approval and dialect match are both unknowns, **run
+`--max-samples 20` first** and eyeball the hypotheses before committing to a
+full run.
+
+The `formospeech/*-v3-*` checkpoint additionally selects its dialect via an
+*initial text prompt* rather than a language tag (its model card's own usage
+example passes `prompt_ids=processor.get_prompt_ids(dialect_id)` to
+`generate()`, where `dialect_id` is one of `htia_sixian`/`htia_hailu`/
+`htia_dapu`/`htia_raoping`/`htia_zhaoan`/`htia_nansixian`). This is wired up
+via `--dialect-prompt`; the script strips the resulting prefix back out of
+the decoded text (`_strip_dialect_prompt_prefix`, mirroring the model card's
+own `.replace(f" {dialect_id}", "")` post-processing). This benchmark's audio
+doesn't document which dialect it is, so you may need to try a couple of
+`--dialect-prompt` values on a small `--max-samples` run and keep whichever
+gives the lower baseline CER. The `v2` checkpoint needs no such flag - it has
+no per-dialect prompting, just plain `--language chinese --task transcribe`
+like any other checkpoint here.
+
+**1. Build the Hakka LM corpus** (writes only `char.txt`, per the no-word-
+segmenter note above):
+
+```
+uv run prepare_hakka_lm_corpus.py --output-dir ./lm_corpus_hak
+```
+
+**2. Train the KenLM model:**
+
+```
+bash scripts/build_kenlm_models.sh ./lm_corpus_hak ./lm_hak
+```
+
+**3. Run the fusion eval.** With the gated v3 checkpoint (adjust
+`--dialect-prompt` per the note above):
+
+```
+uv run eval_aishell_ngram_fusion.py --max-samples 20 \
+    --dataset-repo slammax/formosan_asr_benchmark --dataset-config hakka \
+    --text-column transcript --id-column audio_id --lm-holdout-frac 0.3 \
+    --lang hak --schemes char --language chinese --lm-dir ./lm_hak \
+    --asr-model formospeech/whisper-large-v3-taiwanese-hakka \
+    --dialect-prompt htia_sixian
+```
+
+Or with the gated v2 checkpoint (no `--dialect-prompt` needed):
+
+```
+uv run eval_aishell_ngram_fusion.py --max-samples 20 \
+    --dataset-repo slammax/formosan_asr_benchmark --dataset-config hakka \
+    --text-column transcript --id-column audio_id --lm-holdout-frac 0.3 \
+    --lang hak --schemes char --language chinese --lm-dir ./lm_hak \
+    --asr-model formospeech/whisper-large-v2-taiwanese-hakka-v1
+```
+
+Once the baseline CER on that smoke run looks sane (comparable to the
+~5-10% range seen on AISHELL-1/MDCC, not near 50%+), drop `--max-samples 20`
+and let it run on the full ~3500-utterance eval partition.
+
+**4. Analyze** exactly as before (auto-named `./logs/hak_ngram_fusion`):
+
+```
+uv run analyze_aishell_ngram_fusion.py --run-dir ./logs/hak_ngram_fusion
+```
+
 ### Methodology notes
 
-- **Metric.** Alpha is always tuned to minimize CER (segmentation-tool
-  independent, the standard metric for Chinese) for *both* schemes, so
-  RER(CER) is directly comparable across char vs. word conditions. WER is
-  deliberately not computed anywhere in this pipeline: Chinese languages have
-  no native word boundaries, so any "word" only exists relative to an
-  arbitrary segmentation tool's choices - unlike CER, it wouldn't be
-  measuring something intrinsic to the text.
+- **Metric.** For Chinese-family languages, alpha is always tuned to minimize
+  CER (segmentation-tool independent) for *both* schemes; WER is not computed
+  there because Chinese has no native word boundaries. For English
+  (`--lang en`) the metric is WER — that is the WhisperLM-analogue quantity
+  the negative control is about.
 - **RER.** `(baseline_error - condition_error) / baseline_error`, computed on
   the eval slice; `alpha=0` reproduces the no-LM baseline for every order as a
   built-in sanity check.

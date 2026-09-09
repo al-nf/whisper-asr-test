@@ -21,3 +21,8 @@ dependencies = [
     "tqdm>=4.68.3",
     "transformers>=4.46.0",
 ]
+
+[dependency-groups]
+dev = [
+    "matplotlib>=3.11.1",
+]

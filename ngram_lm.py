@@ -1,15 +1,13 @@
-"""Shared helpers for the Mandarin (AISHELL-1) and Cantonese (MDCC) n-gram
-fusion experiments.
+"""Shared helpers for the Mandarin (AISHELL-1), Cantonese (MDCC), Hakka, and
+English (LibriSpeech) n-gram fusion experiments.
 
-Two tokenization schemes are supported everywhere in this experiment:
+Two tokenization schemes are supported:
 
-- "char": every Han character is its own token (no segmentation needed;
-  language-independent).
-- "word": word segmentation. Mandarin uses `jieba` (trained on Mandarin
-  corpora); Cantonese uses `pycantonese.segment` instead, since jieba's
-  dictionary/model is Mandarin-specific and mis-segments (or falls back to
-  near char-level on) Cantonese-only vocabulary and grammatical particles
-  (啦/嘅/喺/佢/唔 etc.) - see `get_tokenizers`.
+- "char": every remaining character is its own token (no segmentation).
+- "word": word segmentation. Mandarin uses `jieba`; Cantonese uses
+  `pycantonese.segment` (jieba's dictionary is Mandarin-specific); English
+  uses whitespace split after `normalize_en_text`. Hakka ("hak") has no
+  "word" entry: no maintained Hakka segmenter exists, so pass `--schemes char`.
 
 `KenLMScorer` wraps a compiled KenLM binary (`.klm`, built by
 `scripts/build_kenlm_models.sh` from `lmplz`/`build_binary`) and exposes a
@@ -57,13 +55,29 @@ def tokenize_word_cantonese(text: str) -> List[str]:
     return [tok for tok in pycantonese.segment(text) if tok.strip()]
 
 
+def tokenize_word_english(text: str) -> List[str]:
+    """Whitespace word tokenization (English). `text` is expected to already
+    be lowercased and punctuation-stripped (see `normalize_en_text`)."""
+    return text.split()
+
+
+def tokenize_char_nospace(text: str) -> List[str]:
+    """Character tokenization that drops whitespace - the English analogue of
+    `tokenize_char` on Chinese (where `normalize_zh_text` has already removed
+    spaces, so `list(text)` is letters-only)."""
+    return [c for c in text if not c.isspace()]
+
+
 # Registry of {scheme: tokenizer} per language. `char` is shared; only the
 # `word` segmenter differs. Both eval_aishell_ngram_fusion.py and the
 # prepare_*_lm_corpus.py scripts select one of these via a `--lang` flag, so
-# corpus-building and eval-time candidate tokenization always agree.
+# corpus-building and eval-time candidate tokenization always agree. "hak"
+# deliberately has no "word" key - see module docstring.
 TOKENIZERS_BY_LANG = {
     "zh": {"char": tokenize_char, "word": tokenize_word_jieba},
     "yue": {"char": tokenize_char, "word": tokenize_word_cantonese},
+    "hak": {"char": tokenize_char},
+    "en": {"char": tokenize_char_nospace, "word": tokenize_word_english},
 }
 
 
@@ -90,6 +104,44 @@ def normalize_zh_text(text: str) -> str:
     import re
 
     return re.sub(r"[^\w]", "", text, flags=re.UNICODE)
+
+
+def normalize_en_text(text: str) -> str:
+    """Lowercase, strip punctuation, collapse whitespace. Mirrors the non-zh
+    branch of `normalize_text` in eval.py. Spaces are kept: English WER and
+    word-n-gram tokenization both need them."""
+    import re
+
+    text = text.lower()
+    text = re.sub(r"[^\w\s]", "", text, flags=re.UNICODE)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def normalize_for_lang(text: str, lang: str) -> str:
+    if lang == "en":
+        return normalize_en_text(text)
+    return normalize_zh_text(text)
+
+
+def is_lm_holdout(utt_id: str, holdout_frac: float, seed: int) -> bool:
+    """Deterministic membership test used to self-partition a *single-split*
+    dataset (e.g. formosan_asr_benchmark's Hakka subset, which - unlike
+    AISHELL-1/MDCC - ships only one `test` split, with no separate
+    train/transcript source to build the LM corpus from without touching the
+    eval sentences).
+
+    `prepare_hakka_lm_corpus.py` excludes every utterance where this returns
+    True from the LM training text; `eval_aishell_ngram_fusion.py --lm-holdout-frac`
+    evaluates ASR n-gram fusion on exactly (and only) those same utterances -
+    so the two scripts must be called with the same `holdout_frac`/`seed` (the
+    default of each matches the other). Uses a stable hash (md5, not Python's
+    salted built-in `hash()`) so membership is reproducible across processes
+    and across the two scripts/machines."""
+    import hashlib
+
+    digest = hashlib.md5(f"{seed}:{utt_id}".encode("utf-8")).hexdigest()
+    bucket = int(digest[:8], 16) / 0xFFFFFFFF  # deterministic float in [0, 1)
+    return bucket < holdout_frac
 
 
 class KenLMScorer:

@@ -1,13 +1,23 @@
 """Verdict tool for eval_aishell_ngram_fusion.py: turns the raw per-condition
-CER numbers into an explicit statement about the hypothesis under test -
+error numbers into an explicit statement about the hypothesis under test.
+
+For Chinese-family runs (zh/yue/hak), the hypothesis is:
 
     "Chinese ASR benefits most from a low-order (bi/tri-gram) n-gram LM,
     unlike the 5-gram order typically used for space-delimited languages."
 
-(WER is deliberately not used anywhere in this analysis: Mandarin has no
-native word boundaries, so any "word" only exists relative to an arbitrary
-segmentation tool's choices, unlike CER which measures something intrinsic
-to the text. `eval_aishell_ngram_fusion.py` doesn't report it either.)
+For English (`--lang en`, the negative control), the hypothesis is inverted:
+
+    "English word n-grams keep improving through order 4/5 rather than
+    saturating at 2/3" — if this is *not* supported, the Chinese result may
+    be an artifact of N-best rescoring rather than of character-dense
+    tokenization.
+
+The metric is CER for Chinese-family languages (WER is not used there:
+Mandarin has no native word boundaries) and WER for English. `eval_aishell_ngram_fusion.py`
+stores the chosen metric's value under the historical `cer`/`eval_cer` keys
+so existing result JSON still loads; this script reads `run_config.metric`
+to decide which jiwer alignment to bootstrap.
 
 For each tokenization scheme, this:
   1. Prints a RER-vs-order table (the raw evidence).
@@ -62,10 +72,13 @@ class Prepared:
     cer_lens: List[int]
 
 
-def prepare_rows(rows: List[dict]) -> Prepared:
+def prepare_rows(rows: List[dict], metric: str = "cer") -> Prepared:
     cer_edits, cer_lens = [], []
     for row in rows:
-        c = jiwer.process_characters([row["ref"]], [row["hyp"]])
+        if metric == "wer":
+            c = jiwer.process_words([row["ref"]], [row["hyp"]])
+        else:
+            c = jiwer.process_characters([row["ref"]], [row["hyp"]])
         cer_edits.append(c.substitutions + c.deletions + c.insertions)
         cer_lens.append(c.hits + c.substitutions + c.deletions)
     return Prepared(cer_edits, cer_lens)
@@ -128,11 +141,13 @@ def render_rer_table(
     baseline: dict,
     conditions: List[dict],
     cer_stats: "dict[int, tuple]",
+    metric: str = "cer",
 ) -> Table:
+    metric_label = metric.upper()
     table = Table(title=f"RER vs. n-gram order - scheme={scheme}")
     table.add_column("Order", justify="right")
-    table.add_column("CER", justify="right")
-    table.add_column("RER (CER)", justify="right")
+    table.add_column(metric_label, justify="right")
+    table.add_column(f"RER ({metric_label})", justify="right")
     table.add_column("95% CI", justify="right")
     table.add_column("P(no improvement)", justify="right")
     table.add_row("baseline", f"{baseline['cer']:.4f}", "-", "-", "-")
@@ -148,18 +163,28 @@ def render_rer_table(
     return table
 
 
-def verdict_for_scheme(scheme: str, baseline: dict, conditions: List[dict], n_boot: int, seed: int, console: Console) -> None:
-    baseline_prepared = prepare_rows(baseline["rows"])
-    condition_prepared = {c["order"]: prepare_rows(c["rows"]) for c in conditions}
+def verdict_for_scheme(
+    scheme: str,
+    baseline: dict,
+    conditions: List[dict],
+    n_boot: int,
+    seed: int,
+    console: Console,
+    metric: str = "cer",
+    lang: str = "zh",
+) -> None:
+    baseline_prepared = prepare_rows(baseline["rows"], metric=metric)
+    condition_prepared = {c["order"]: prepare_rows(c["rows"], metric=metric) for c in conditions}
 
     cer_stats = {
         order: bootstrap_rer(baseline_prepared, prepared, n_boot, seed + order)
         for order, prepared in condition_prepared.items()
     }
-    console.print(render_rer_table(scheme, baseline, conditions, cer_stats))
+    console.print(render_rer_table(scheme, baseline, conditions, cer_stats, metric=metric))
 
     best = min(conditions, key=lambda c: c["eval_cer"])
     best_mean_rer, best_lo, best_hi, best_p_no = cer_stats[best["order"]]
+    metric_label = metric.upper()
 
     if best_p_no > 0.05:
         console.print(
@@ -169,7 +194,7 @@ def verdict_for_scheme(scheme: str, baseline: dict, conditions: List[dict], n_bo
         )
         return
 
-    # Orders statistically indistinguishable from the best (CI on the CER gap includes 0).
+    # Orders statistically indistinguishable from the best (CI on the error gap includes 0).
     tied_orders = [best["order"]]
     for c in conditions:
         if c["order"] == best["order"]:
@@ -181,15 +206,28 @@ def verdict_for_scheme(scheme: str, baseline: dict, conditions: List[dict], n_bo
             tied_orders.append(c["order"])
     tied_orders.sort()
 
+    console.print(
+        f"[bold]{scheme}[/bold]: best order={best['order']} "
+        f"({metric_label}={best['eval_cer']:.4f}, RER={best_mean_rer:+.1%} [{best_lo:+.1%}, {best_hi:+.1%}]). "
+        f"Statistically tied with orders: {tied_orders}."
+    )
+
+    if lang == "en":
+        # Negative control: English should still need 4/5-gram. Supported when
+        # the tied-best set does not include 2 or 3.
+        high_order_supported = not any(o in (2, 3) for o in tied_orders)
+        verdict_color = "green" if high_order_supported else "red"
+        verdict_word = "SUPPORTED" if high_order_supported else "NOT SUPPORTED"
+        console.print(
+            f"[{verdict_color}]Negative control (\"English keeps improving through 4/5-gram, unlike Chinese\") "
+            f"{verdict_word} for scheme={scheme}: tied best-order set is {tied_orders}."
+            f"[/{verdict_color}]\n"
+        )
+        return
+
     low_order_supported = any(o in (2, 3) for o in tied_orders)
     verdict_color = "green" if low_order_supported else "red"
     verdict_word = "SUPPORTED" if low_order_supported else "NOT SUPPORTED"
-
-    console.print(
-        f"[bold]{scheme}[/bold]: best order={best['order']} "
-        f"(CER={best['eval_cer']:.4f}, RER={best_mean_rer:+.1%} [{best_lo:+.1%}, {best_hi:+.1%}]). "
-        f"Statistically tied with orders: {tied_orders}."
-    )
     console.print(
         f"[{verdict_color}]Hypothesis (\"lowest relative error at bigram or trigram\") {verdict_word} "
         f"for scheme={scheme}: {'2 or 3 is in' if low_order_supported else 'the tied best-order set excludes 2 and 3, it is'} "
@@ -218,13 +256,17 @@ def main() -> None:
         conditions.sort(key=lambda c: c["order"])
 
     dataset_repo = results.get("run_config", {}).get("dataset_repo", "AISHELL-1")
+    lang = results.get("run_config", {}).get("lang", "zh")
+    metric = results.get("run_config", {}).get("metric") or ("wer" if lang == "en" else "cer")
     console = Console()
     console.print(
         f"[bold]{dataset_repo} n-gram fusion analysis[/bold] "
-        f"(n_eval={results['n_eval']}, bootstrap={args.bootstrap} resamples)\n"
+        f"(n_eval={results['n_eval']}, bootstrap={args.bootstrap} resamples, metric={metric})\n"
     )
     for scheme, conditions in conditions_by_scheme.items():
-        verdict_for_scheme(scheme, baseline, conditions, args.bootstrap, args.seed, console)
+        verdict_for_scheme(
+            scheme, baseline, conditions, args.bootstrap, args.seed, console, metric=metric, lang=lang
+        )
 
 
 if __name__ == "__main__":

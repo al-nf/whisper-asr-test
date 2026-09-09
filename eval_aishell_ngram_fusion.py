@@ -6,14 +6,21 @@ word-segmented (jieba) tokenization.
 Benchmark: AISHELL-1 test set (`Serenalay/AISHELL-1`, 7176 utterances) by
 default. Also usable for Cantonese via `--lang yue --dataset-repo
 ming030890/mdcc --text-column transcript --id-column id --asr-model
-<cantonese checkpoint>` - see README for the full Cantonese walkthrough.
-`--lang` only changes the "word" tokenizer (jieba for zh,
-pycantonese.segment for yue); "char" tokenization is identical either way.
-Note: only whisper-large-v3/-turbo-derived checkpoints have a real
-`<|yue|>` language token (added in large-v3); tiny/base/small/medium
-Cantonese fine-tunes were trained against `<|zh|>` like any Mandarin
-fine-tune, so `--language` should stay `chinese` for those (the script
-auto-detects and falls back if you pass `cantonese`/`yue` on such a model).
+<cantonese checkpoint>`, or Hakka via `--lang hak --schemes char --dataset-repo
+slammax/formosan_asr_benchmark --dataset-config hakka --text-column transcript
+--id-column audio_id --lm-holdout-frac 0.3 --asr-model
+formospeech/whisper-large-v3-taiwanese-hakka --dialect-prompt htia_sixian`
+(gated checkpoint - request HF access first; see README for why the one
+non-gated Hakka checkpoint isn't usable here) - see README for all three
+walkthroughs. `--lang` only changes
+the "word" tokenizer (jieba for zh, pycantonese.segment for yue; hak has no
+"word" tokenizer at all - no maintained Hakka segmenter exists, so pass
+`--schemes char`); "char" tokenization is identical across all three. Note:
+only whisper-large-v3/-turbo-derived checkpoints have a real `<|yue|>`
+language token (added in large-v3); tiny/base/small/medium Cantonese
+fine-tunes were trained against `<|zh|>` like any Mandarin fine-tune, so
+`--language` should stay `chinese` for those (the script auto-detects and
+falls back if you pass `cantonese`/`yue` on such a model).
 Model: a fine-tuned Whisper checkpoint (default: `junsor/whisper-small-aishell`).
 
 Fusion mechanism: N-best rescoring, not shallow fusion during beam search.
@@ -38,10 +45,9 @@ sanity check.
 
 RER (relative error-rate reduction) = (baseline_error - condition_error) /
 baseline_error, computed against the *same* eval subset's baseline. Alpha is
-always tuned to minimize CER, the standard metric for Chinese (WER isn't
-reported: Mandarin has no native word boundaries, so any "word" only exists
-relative to an arbitrary segmentation tool's choices - unlike CER, it
-wouldn't be measuring something intrinsic to the text).
+tuned to minimize CER for Chinese-family languages (the standard metric;
+WER isn't reported there because Mandarin has no native word boundaries) and
+WER for English (`--lang en`), which is the WhisperLM-analogue metric.
 
 Usage:
     uv run eval_aishell_ngram_fusion.py
@@ -76,13 +82,18 @@ from typing import List, Optional
 
 import torch
 from datasets import load_dataset
-from jiwer import cer
+from jiwer import cer, wer
 from rich.console import Console
 from rich.table import Table
 from tqdm import tqdm
 from transformers import GenerationConfig, WhisperForConditionalGeneration, WhisperProcessor
 
-from ngram_lm import KenLMScorer, TOKENIZERS, get_tokenizers, normalize_zh_text
+from ngram_lm import (
+    KenLMScorer,
+    get_tokenizers,
+    is_lm_holdout,
+    normalize_for_lang,
+)
 
 DATASET_REPO = "Serenalay/AISHELL-1"
 DEFAULT_ASR_MODEL = "junsor/whisper-small-aishell"
@@ -262,6 +273,21 @@ def _strip_leaked_control_tokens(text: str) -> str:
     return cleaned
 
 
+def _strip_dialect_prompt_prefix(text: str, dialect_prompt: str) -> str:
+    """`--dialect-prompt` (see `--prompt-ids` mechanism used by
+    formospeech/whisper-large-v3-taiwanese-hakka's per-dialect prompt_ids) is
+    passed to `generate()` as literal *text* tokens (an "initial prompt"), not
+    special/control tokens - so `output.sequences` includes it verbatim at the
+    start of every candidate, and `skip_special_tokens=True` does nothing to
+    it. The model card's own usage example handles this with
+    `transcription.replace(f" {dialect_id}", "")`; this does the equivalent,
+    tolerating a leading space or not."""
+    for prefix in (dialect_prompt + " ", dialect_prompt):
+        if text.startswith(prefix):
+            return text[len(prefix) :]
+    return text
+
+
 def _run_batch(
     model,
     processor,
@@ -274,9 +300,17 @@ def _run_batch(
     diversity_opts: Optional[dict] = None,
     id_column: str = "name",
     text_column: str = "text",
+    prompt_ids: Optional["torch.Tensor"] = None,
+    dialect_prompt: Optional[str] = None,
+    normalize=None,
 ) -> List[dict]:
     """Runs beam search (or sampling) on a single (small) chunk of the
     dataset. Raises on failure - callers handle OOM-style retries.
+
+    `prompt_ids`/`dialect_prompt`: for multi-dialect checkpoints like
+    formospeech/whisper-large-v3-taiwanese-hakka, which select a dialect via
+    an "initial prompt" of text tokens (`processor.get_prompt_ids(dialect_id)`)
+    rather than a language tag - see `--dialect-prompt` in `parse_args`.
 
     Plain (deterministic) beam search on a narrowly fine-tuned, highly
     confident model - like an AISHELL-only Whisper checkpoint on short,
@@ -319,6 +353,8 @@ def _run_batch(
         language=language,
         task=task,
     )
+    if prompt_ids is not None:
+        generate_kwargs["prompt_ids"] = prompt_ids
     num_beam_groups = opts.get("num_beam_groups", 1)
     if num_beam_groups > 1:
         generate_kwargs["num_beam_groups"] = num_beam_groups
@@ -345,7 +381,9 @@ def _run_batch(
         output = model.generate(input_features, **generate_kwargs)
 
     texts = [
-        _strip_leaked_control_tokens(t)
+        _strip_leaked_control_tokens(
+            _strip_dialect_prompt_prefix(t, dialect_prompt) if dialect_prompt else t
+        )
         for t in processor.batch_decode(output.sequences, skip_special_tokens=True)
     ]
     sequences_scores = getattr(output, "sequences_scores", None)
@@ -354,13 +392,16 @@ def _run_batch(
     else:
         scores = _transition_avg_logprobs(model, output.sequences, output.scores)
 
+    if normalize is None:
+        normalize = lambda t: normalize_for_lang(t, "zh")
+
     out = []
     for i in range(len(audio_arrays)):
         item_texts = texts[i * num_beams : (i + 1) * num_beams]
         item_scores = scores[i * num_beams : (i + 1) * num_beams]
         seen = {}
         for text, score in zip(item_texts, item_scores):
-            norm = normalize_zh_text(text)
+            norm = normalize(text)
             if norm not in seen or score > seen[norm]:
                 seen[norm] = score
         candidates = sorted(
@@ -371,7 +412,7 @@ def _run_batch(
         out.append(
             {
                 "utt_id": sub_dataset[id_column][i],
-                "ref": normalize_zh_text(sub_dataset[text_column][i]),
+                "ref": normalize(sub_dataset[text_column][i]),
                 "candidates": candidates,
             }
         )
@@ -404,15 +445,20 @@ def _run_batch_with_retry(
     diversity_opts: Optional[dict] = None,
     id_column: str = "name",
     text_column: str = "text",
+    prompt_ids: Optional["torch.Tensor"] = None,
+    dialect_prompt: Optional[str] = None,
+    normalize=None,
 ) -> List[dict]:
     """Runs `_run_batch`, and on a CUDA OOM / Jetson NVML-allocator error
     (see module docstring), frees memory and retries with the batch split in
     half - down to single utterances. A single utterance that still fails
     is recorded with an empty hypothesis rather than aborting the whole run."""
+    if normalize is None:
+        normalize = lambda t: normalize_for_lang(t, "zh")
     try:
         return _run_batch(
             model, processor, device, sub_dataset, num_beams, max_new_tokens, language, task, diversity_opts,
-            id_column, text_column,
+            id_column, text_column, prompt_ids, dialect_prompt, normalize,
         )
     except RuntimeError as e:
         if not _is_recoverable_cuda_error(e):
@@ -427,7 +473,7 @@ def _run_batch_with_retry(
             return [
                 {
                     "utt_id": utt_id,
-                    "ref": normalize_zh_text(sub_dataset[text_column][0]),
+                    "ref": normalize(sub_dataset[text_column][0]),
                     "candidates": [{"text": "", "acoustic_avg_logprob": 0.0}],
                 }
             ]
@@ -437,10 +483,10 @@ def _run_batch_with_retry(
         right = sub_dataset.select(range(mid, n))
         return _run_batch_with_retry(
             model, processor, device, left, num_beams, max_new_tokens, language, task, diversity_opts,
-            id_column, text_column,
+            id_column, text_column, prompt_ids, dialect_prompt, normalize,
         ) + _run_batch_with_retry(
             model, processor, device, right, num_beams, max_new_tokens, language, task, diversity_opts,
-            id_column, text_column,
+            id_column, text_column, prompt_ids, dialect_prompt, normalize,
         )
 
 
@@ -458,6 +504,9 @@ def generate_nbest(
     diversity_opts: Optional[dict] = None,
     id_column: str = "name",
     text_column: str = "text",
+    prompt_ids: Optional["torch.Tensor"] = None,
+    dialect_prompt: Optional[str] = None,
+    normalize=None,
 ) -> List[dict]:
     """Runs Whisper beam search once per utterance, keeping the top `num_beams`
     candidates and their length-normalized acoustic log-probs. This is the
@@ -486,7 +535,7 @@ def generate_nbest(
             sub = subset.select(range(start, end))
             batch_results = _run_batch_with_retry(
                 model, processor, device, sub, num_beams, max_new_tokens, language, task, diversity_opts,
-                id_column, text_column,
+                id_column, text_column, prompt_ids, dialect_prompt, normalize,
             )
             for item in batch_results:
                 item["utt_id"] = str(item["utt_id"])
@@ -506,7 +555,8 @@ def load_scorers(lm_dir: str, schemes: List[str], orders: List[int]) -> "dict[tu
             if not os.path.exists(path):
                 raise FileNotFoundError(
                     f"Missing KenLM model: {path}\n"
-                    "Run prepare_aishell_lm_corpus.py (or prepare_mdcc_lm_corpus.py for Cantonese) then "
+                    "Run prepare_aishell_lm_corpus.py (or prepare_mdcc_lm_corpus.py / "
+                    "prepare_librispeech_lm_corpus.py) then "
                     f"'bash scripts/build_kenlm_models.sh <corpus_dir> {lm_dir}' first."
                 )
             scorers[(scheme, order)] = KenLMScorer(path)
@@ -524,6 +574,12 @@ def rescore_candidates(nbest_item: dict, tokens_by_candidate: List[List[str]], s
     return best_idx
 
 
+def error_rate(refs: List[str], hyps: List[str], metric: str) -> float:
+    if metric == "wer":
+        return wer(refs, hyps)
+    return cer(refs, hyps)
+
+
 def evaluate_condition(
     nbest: List[dict],
     tune_idx: List[int],
@@ -533,8 +589,9 @@ def evaluate_condition(
     scorer: KenLMScorer,
     alpha_grid: List[float],
     tokens_cache: List[List[List[str]]],
+    metric: str = "cer",
 ) -> dict:
-    best_alpha, best_tune_cer = alpha_grid[0], float("inf")
+    best_alpha, best_tune_err = alpha_grid[0], float("inf")
     for alpha in alpha_grid:
         refs, hyps = [], []
         for i in tune_idx:
@@ -542,9 +599,9 @@ def evaluate_condition(
             best_idx = rescore_candidates(item, tokens_cache[i], scorer, alpha)
             refs.append(item["ref"])
             hyps.append(item["candidates"][best_idx]["text"])
-        tune_cer = cer(refs, hyps)
-        if tune_cer < best_tune_cer:
-            best_alpha, best_tune_cer = alpha, tune_cer
+        tune_err = error_rate(refs, hyps, metric)
+        if tune_err < best_tune_err:
+            best_alpha, best_tune_err = alpha, tune_err
 
     rows = []
     for i in eval_idx:
@@ -554,18 +611,20 @@ def evaluate_condition(
 
     refs = [r["ref"] for r in rows]
     hyps = [r["hyp"] for r in rows]
+    eval_err = error_rate(refs, hyps, metric)
 
     return {
         "scheme": scheme,
         "order": order,
         "best_alpha": best_alpha,
-        "tune_cer": best_tune_cer,
-        "eval_cer": cer(refs, hyps),
+        "metric": metric,
+        "tune_cer": best_tune_err,
+        "eval_cer": eval_err,
         "rows": rows,
     }
 
 
-def compute_baseline(nbest: List[dict], eval_idx: List[int]) -> dict:
+def compute_baseline(nbest: List[dict], eval_idx: List[int], metric: str = "cer") -> dict:
     """No-LM baseline: rank-0 (top acoustic score) candidate for every
     utterance in the eval subset."""
     rows = []
@@ -574,25 +633,32 @@ def compute_baseline(nbest: List[dict], eval_idx: List[int]) -> dict:
         rows.append({"utt_id": item["utt_id"], "ref": item["ref"], "hyp": item["candidates"][0]["text"]})
     refs = [r["ref"] for r in rows]
     hyps = [r["hyp"] for r in rows]
-    return {"cer": cer(refs, hyps), "rows": rows}
+    err = error_rate(refs, hyps, metric)
+    return {"cer": err, "metric": metric, "rows": rows}
 
 
-def render_table(baseline: dict, conditions: List[dict], title: str = "AISHELL-1 N-gram Fusion Results (N-best rescoring)") -> Table:
+def render_table(
+    baseline: dict,
+    conditions: List[dict],
+    title: str = "AISHELL-1 N-gram Fusion Results (N-best rescoring)",
+    metric: str = "cer",
+) -> Table:
+    metric_label = metric.upper()
     table = Table(title=title)
     table.add_column("Scheme", justify="left")
     table.add_column("Order", justify="right")
     table.add_column("alpha*", justify="right")
-    table.add_column("CER", justify="right")
-    table.add_column("RER (CER)", justify="right")
+    table.add_column(metric_label, justify="right")
+    table.add_column(f"RER ({metric_label})", justify="right")
     table.add_row("baseline", "-", "-", f"{baseline['cer']:.4f}", "-")
     for c in conditions:
-        rer_cer = (baseline["cer"] - c["eval_cer"]) / baseline["cer"] if baseline["cer"] else float("nan")
+        rer = (baseline["cer"] - c["eval_cer"]) / baseline["cer"] if baseline["cer"] else float("nan")
         table.add_row(
             c["scheme"],
             str(c["order"]),
             f"{c['best_alpha']:.2f}",
             f"{c['eval_cer']:.4f}",
-            f"{rer_cer:+.1%}",
+            f"{rer:+.1%}",
         )
     return table
 
@@ -607,21 +673,46 @@ def parse_args() -> argparse.Namespace:
         default=DATASET_REPO,
         help="HF datasets repo to evaluate on. Default is the AISHELL-1 (Mandarin) mirror; pass "
         "'ming030890/mdcc' (with --dataset-split test --text-column transcript --id-column id "
-        "--language cantonese) to run the same test on Cantonese.",
+        "--language cantonese) for Cantonese, or 'openslr/librispeech_asr' (with --dataset-config clean "
+        "--dataset-split test --text-column text --id-column id --language english --lang en) for the "
+        "English negative control.",
+    )
+    parser.add_argument(
+        "--dataset-config",
+        default=None,
+        help="HF datasets config/subset name (the 'name=' arg to load_dataset), if --dataset-repo has "
+        "multiple subsets - e.g. 'hakka' for slammax/formosan_asr_benchmark.",
     )
     parser.add_argument("--dataset-split", default="test", help="Split of --dataset-repo to evaluate on.")
     parser.add_argument("--text-column", default="text", help="Dataset column holding the reference transcript.")
     parser.add_argument("--id-column", default="name", help="Dataset column holding a unique utterance id.")
     parser.add_argument(
+        "--lm-holdout-frac",
+        type=float,
+        default=None,
+        help="For datasets with no separate train/transcript split to build the LM corpus from (e.g. Hakka's "
+        "formosan_asr_benchmark, which ships only one `test` split): restricts evaluation to the deterministic "
+        "holdout partition of --dataset-split that prepare_hakka_lm_corpus.py excluded from the LM corpus (see "
+        "ngram_lm.is_lm_holdout) - must match that script's --holdout-frac/--seed. Leave unset for AISHELL-1/MDCC, "
+        "which already have disjoint splits and don't need this.",
+    )
+    parser.add_argument(
         "--lang",
-        choices=["zh", "yue"],
+        choices=["zh", "yue", "hak", "en"],
         default="zh",
-        help="Selects the 'word' tokenizer: jieba for Mandarin (zh) or pycantonese.segment for Cantonese (yue). "
-        "'char' tokenization is identical either way. Use 'yue' together with --dataset-repo ming030890/mdcc.",
+        help="Selects the 'word' tokenizer: jieba for Mandarin (zh), pycantonese.segment for Cantonese (yue), "
+        "whitespace split for English (en), or none for Hakka (hak - pass --schemes char). Use 'en' with "
+        "--dataset-repo openslr/librispeech_asr --dataset-config clean.",
     )
     parser.add_argument("--lm-dir", default="./lm", help="Directory containing {char,word}/order{n}.klm KenLM binaries.")
     parser.add_argument("--orders", nargs="+", type=int, default=DEFAULT_ORDERS)
-    parser.add_argument("--schemes", nargs="+", choices=list(TOKENIZERS), default=DEFAULT_SCHEMES)
+    parser.add_argument("--schemes", nargs="+", choices=["char", "word"], default=DEFAULT_SCHEMES)
+    parser.add_argument(
+        "--metric",
+        choices=["cer", "wer"],
+        default=None,
+        help="Error metric used to tune alpha and report RER. Default: cer for zh/yue/hak, wer for en.",
+    )
     parser.add_argument("--alpha-grid", nargs="+", type=float, default=DEFAULT_ALPHA_GRID)
     parser.add_argument("--num-beams", type=int, default=5, help="Beam width == N-best size.")
     parser.add_argument(
@@ -658,6 +749,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--language", default="chinese")
     parser.add_argument("--task", default="transcribe")
+    parser.add_argument(
+        "--dialect-prompt",
+        default=None,
+        help="For multi-dialect checkpoints that select a dialect via an 'initial prompt' of text tokens "
+        "instead of a language tag - e.g. formospeech/whisper-large-v3-taiwanese-hakka, which expects one of "
+        "htia_sixian/htia_hailu/htia_dapu/htia_raoping/htia_zhaoan/htia_nansixian. Passed to "
+        "processor.get_prompt_ids() and forwarded as generate()'s prompt_ids; the resulting prefix is stripped "
+        "back out of the decoded text (see _strip_dialect_prompt_prefix). Leave unset for checkpoints (including "
+        "the default AISHELL/MDCC ones) that select language via --language instead.",
+    )
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument(
         "--dtype",
@@ -681,11 +782,30 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-    if args.lang == "yue" and args.asr_model == DEFAULT_ASR_MODEL:
+    if args.metric is None:
+        args.metric = "wer" if args.lang == "en" else "cer"
+    if args.lang == "en" and args.language == "chinese":
+        print("[warn] --lang en with default --language chinese; switching to english.")
+        args.language = "english"
+    if args.lang == "en" and args.max_new_tokens == 48:
         print(
-            f"[warn] --lang yue but --asr-model is still the Mandarin default ({DEFAULT_ASR_MODEL}). "
-            "Pass a Cantonese-finetuned checkpoint, e.g. --asr-model Oblivion208/whisper-small-cantonese "
-            "(see README)."
+            "[warn] --max-new-tokens 48 is short for LibriSpeech; consider 128 if hypotheses look truncated."
+        )
+    if args.lang != "zh" and args.asr_model == DEFAULT_ASR_MODEL:
+        example = {
+            "yue": "Oblivion208/whisper-small-cantonese",
+            "hak": "formospeech/whisper-large-v3-taiwanese-hakka (gated - request access on HF first; needs "
+            "--dialect-prompt too) - see README for why the open NUTN-KWS Hakka checkpoint isn't a good baseline",
+            "en": "openai/whisper-small",
+        }[args.lang]
+        print(
+            f"[warn] --lang {args.lang} but --asr-model is still the Mandarin default ({DEFAULT_ASR_MODEL}). "
+            f"Pass a checkpoint fine-tuned for that language, e.g. --asr-model {example} (see README)."
+        )
+    if args.lang == "hak" and "word" in args.schemes:
+        print(
+            "[warn] --lang hak has no 'word' tokenizer (no maintained Hakka segmenter exists) - pass "
+            "--schemes char explicitly. Continuing, but the 'word' scheme will crash when its tokenizer is looked up."
         )
     if args.run_dir:
         run_dir = args.run_dir
@@ -708,7 +828,8 @@ def main() -> None:
         generation_keys = [
             "asr_model", "num_beams", "num_beam_groups", "diversity_penalty",
             "do_sample", "temperature", "top_k", "top_p",
-            "max_new_tokens", "language", "task", "resolved_dtype",
+            "max_new_tokens", "language", "task", "resolved_dtype", "dialect_prompt",
+            "dataset_repo", "dataset_config", "dataset_split", "lm_holdout_frac", "seed",
         ]
         mismatches = [k for k in generation_keys if prev_config.get(k) != run_config.get(k)]
         if mismatches:
@@ -725,8 +846,19 @@ def main() -> None:
         with open(args.nbest_cache, "r", encoding="utf-8") as f:
             nbest = json.load(f)
     else:
-        print(f"Loading dataset: {args.dataset_repo} ({args.dataset_split} split)")
-        dataset = load_dataset(args.dataset_repo, split=args.dataset_split)
+        config_suffix = f", config={args.dataset_config}" if args.dataset_config else ""
+        print(f"Loading dataset: {args.dataset_repo} ({args.dataset_split} split{config_suffix})")
+        dataset = load_dataset(args.dataset_repo, name=args.dataset_config, split=args.dataset_split)
+        if args.lm_holdout_frac is not None:
+            holdout_mask = [
+                is_lm_holdout(str(utt_id), args.lm_holdout_frac, args.seed) for utt_id in dataset[args.id_column]
+            ]
+            n_before = len(dataset)
+            dataset = dataset.select([i for i, keep in enumerate(holdout_mask) if keep])
+            print(
+                f"  --lm-holdout-frac {args.lm_holdout_frac}: restricted to {len(dataset)}/{n_before} utterances "
+                "excluded from the LM corpus (see prepare_hakka_lm_corpus.py) - must match its --holdout-frac/--seed."
+            )
         if args.max_samples is not None:
             dataset = dataset.select(range(min(args.max_samples, len(dataset))))
 
@@ -747,6 +879,10 @@ def main() -> None:
             args.language = resolved_language
             run_config["language"] = resolved_language
             save_json(run_config_path, run_config)
+
+        prompt_ids = None
+        if args.dialect_prompt:
+            prompt_ids = torch.from_numpy(processor.get_prompt_ids(args.dialect_prompt)).to(args.device)
 
         checkpoint_path = os.path.join(run_dir, "nbest.json")
         diversity_opts = {
@@ -771,14 +907,17 @@ def main() -> None:
             diversity_opts=diversity_opts,
             id_column=args.id_column,
             text_column=args.text_column,
+            prompt_ids=prompt_ids,
+            dialect_prompt=args.dialect_prompt,
+            normalize=lambda t: normalize_for_lang(t, args.lang),
         )
         save_json(checkpoint_path, nbest)
 
     tune_idx, eval_idx = tune_eval_split(len(nbest), args.tune_frac, args.seed)
     print(f"tune={len(tune_idx)} eval={len(eval_idx)} utterances")
 
-    baseline = compute_baseline(nbest, eval_idx)
-    print(f"Baseline: CER={baseline['cer']:.4f}")
+    baseline = compute_baseline(nbest, eval_idx, metric=args.metric)
+    print(f"Baseline: {args.metric.upper()}={baseline['cer']:.4f}")
 
     scorers = load_scorers(args.lm_dir, args.schemes, args.orders)
 
@@ -794,13 +933,17 @@ def main() -> None:
         for order in args.orders:
             print(f"Rescoring: scheme={scheme} order={order}")
             result = evaluate_condition(
-                nbest, tune_idx, eval_idx, scheme, order, scorers[(scheme, order)], args.alpha_grid, tokens_cache
+                nbest, tune_idx, eval_idx, scheme, order, scorers[(scheme, order)], args.alpha_grid, tokens_cache,
+                metric=args.metric,
             )
             conditions.append(result)
-            print(f"  alpha*={result['best_alpha']:.2f} eval_cer={result['eval_cer']:.4f}")
+            print(f"  alpha*={result['best_alpha']:.2f} eval_{args.metric}={result['eval_cer']:.4f}")
 
     console = Console()
-    table = render_table(baseline, conditions, title=f"{args.dataset_repo} N-gram Fusion Results (N-best rescoring)")
+    table = render_table(
+        baseline, conditions, title=f"{args.dataset_repo} N-gram Fusion Results (N-best rescoring)",
+        metric=args.metric,
+    )
     console.print(table)
 
     record_console = Console(record=True, highlight=False)

@@ -33,12 +33,14 @@ for bin in "${LMPLZ}" "${BUILD_BINARY}"; do
     fi
 done
 
+found_any=0
 for scheme in char word; do
     corpus_file="${CORPUS_DIR}/${scheme}.txt"
     if [ ! -f "${corpus_file}" ]; then
-        echo "error: ${corpus_file} not found - run prepare_aishell_lm_corpus.py first" >&2
-        exit 1
+        echo "skip: ${corpus_file} not found"
+        continue
     fi
+    found_any=1
 
     scheme_out_dir="${OUTPUT_DIR}/${scheme}"
     mkdir -p "${scheme_out_dir}"
@@ -57,6 +59,11 @@ for scheme in char word; do
         echo "-> ${klm_path}"
     done
 done
+
+if [ "${found_any}" -eq 0 ]; then
+    echo "error: no {char,word}.txt under ${CORPUS_DIR} - run a prepare_*_lm_corpus.py first" >&2
+    exit 1
+fi
 
 echo
 echo "Done. Models written under ${OUTPUT_DIR}/{char,word}/order{${MIN_ORDER}..${MAX_ORDER}}.klm"
